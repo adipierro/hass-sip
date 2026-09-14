@@ -37,6 +37,7 @@ _PCM_PREBUFFER_SEC = 0.5
 # that needs a clock resync. Paired with the prebuffer this is the most PCM
 # a source may dump in one burst (0.5 + 0.5 = 1.0 s), matching the TX cap.
 _PCM_MAX_BEHIND_SEC = _PCM_PREBUFFER_SEC
+_FFMPEG_STDERR_LIMIT = 8192
 
 
 def default_pcm_frame_bytes(sample_rate: int) -> int:
@@ -332,10 +333,14 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
             "pipe:1",
             stdin=asyncio.subprocess.PIPE if use_stdin else None,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         assert proc.stdout is not None
+        assert proc.stderr is not None
         feeder: asyncio.Task | None = None
+        stderr_task = asyncio.create_task(self._read_stderr(proc.stderr))
+        reached_eof = False
+        pcm_bytes = 0
         try:
             if self._chunks is not None and proc.stdin is not None:
                 feeder = asyncio.create_task(self._feed_stdin(proc.stdin))
@@ -351,17 +356,20 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
             while is_active():
                 chunk = await proc.stdout.read(frame)
                 if not chunk:
+                    reached_eof = True
                     break
                 # ``read`` returns *up to* ``frame`` bytes. Emit whole frames
                 # only, so a short read does not cost a full frame of pacing.
                 buf.extend(chunk)
                 while len(buf) >= frame:
                     push(bytes(buf[:frame]))
+                    pcm_bytes += frame
                     del buf[:frame]
                     pacer.account(frame)
                     await pacer.wait()
             if buf and is_active():
                 push(bytes(buf))
+                pcm_bytes += len(buf)
         finally:
             if feeder is not None:
                 feeder.cancel()
@@ -369,12 +377,30 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
                     await feeder
                 except asyncio.CancelledError:
                     pass
-            if proc.returncode is None:
+            if proc.returncode is None and not reached_eof:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
             await proc.wait()
+            stderr = await stderr_task
+
+        if proc.returncode:
+            detail = stderr.decode(errors="replace").strip()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"ffmpeg exited with status {proc.returncode}{suffix}")
+        if pcm_bytes == 0:
+            raise RuntimeError("ffmpeg produced no audio")
+
+    @staticmethod
+    async def _read_stderr(stderr: asyncio.StreamReader) -> bytes:
+        """Drain stderr while retaining only a bounded diagnostic tail."""
+        tail = bytearray()
+        while chunk := await stderr.read(4096):
+            tail.extend(chunk)
+            if len(tail) > _FFMPEG_STDERR_LIMIT:
+                del tail[: len(tail) - _FFMPEG_STDERR_LIMIT]
+        return bytes(tail)
 
     async def _feed_stdin(self, stdin: asyncio.StreamWriter) -> None:
         """Write streaming chunks to ffmpeg; close stdin when the producer ends."""

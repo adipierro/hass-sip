@@ -371,6 +371,76 @@ def test_ffmpeg_source_requires_exactly_one_input():
         raise AssertionError("expected ValueError")
 
 
+def test_ffmpeg_source_raises_with_bounded_stderr_on_decoder_failure():
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "sys.stderr.write('media request failed: 401 Unauthorized\\n')\n"
+        "raise SystemExit(1)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            assert "401 Unauthorized" in str(err)
+        else:
+            raise AssertionError("expected ffmpeg failure")
+    finally:
+        os.unlink(path)
+
+
+def test_ffmpeg_source_rejects_successful_empty_output():
+    script = "#!" + sys.executable + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            assert "produced no audio" in str(err)
+        else:
+            raise AssertionError("expected empty-output failure")
+    finally:
+        os.unlink(path)
+
+
+def test_failed_audio_source_does_not_emit_playback_done():
+    if sip_client is None:
+        return
+
+    class FailingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            raise RuntimeError("decoder failed")
+
+    async def main():
+        completed = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_playback_done=lambda: completed.append(True)),
+        )
+        client.state = sip_client.SipState.IN_CALL
+        await client._run_source(FailingSource())
+        return completed
+
+    assert asyncio.run(main()) == []
+
+
 def test_ffmpeg_source_streaming_emits_pcm_before_producer_finishes():
     """First stdout PCM must not wait for the stdin iterable to be exhausted."""
     script = (
