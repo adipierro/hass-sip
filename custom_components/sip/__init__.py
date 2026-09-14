@@ -16,6 +16,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_extract_config_entry_ids
 
 from .assist import AssistBridge
@@ -122,6 +123,8 @@ PLATFORMS = [
     Platform.BUTTON,
 ]
 
+CONTACT_REFRESH_INTERVAL = datetime.timedelta(seconds=5)
+
 
 def load_contacts(hass: HomeAssistant) -> dict[str, Any]:
     """Load contacts from the JSON file."""
@@ -149,6 +152,13 @@ def get_contact_info_from_cache(
     elif isinstance(info, str):
         return info, False
     return number, False
+
+
+async def async_refresh_contacts(
+    hass: HomeAssistant, runtime_data: dict[str, Any]
+) -> None:
+    """Reload contacts outside the event loop and replace the shared cache."""
+    runtime_data["contacts"] = await hass.async_add_executor_job(load_contacts, hass)
 
 
 # Service Schemas
@@ -258,6 +268,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "pin_collector": None,
     }
 
+    async def refresh_contacts(_now=None) -> None:
+        await async_refresh_contacts(hass, entry.runtime_data)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, refresh_contacts, CONTACT_REFRESH_INTERVAL)
+    )
+
     # Active session state helpers
     ivr_session: IvrSession | None = None
     assist_bridge: AssistBridge | None = None
@@ -327,13 +344,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def on_incoming_call(caller: str) -> None:
         LOGGER.info("[%s] Incoming call from %s", sip_config.username, caller)
-
-        # Reload contacts in background so any manual edits are picked up dynamically
-        def reload_contacts_bg():
-            contacts_data = load_contacts(hass)
-            entry.runtime_data["contacts"] = contacts_data
-
-        hass.async_add_executor_job(reload_contacts_bg)
 
         caller_name, auto_answer = get_contact_info_from_cache(
             entry.runtime_data.get("contacts", {}), caller

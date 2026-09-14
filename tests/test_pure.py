@@ -5060,6 +5060,32 @@ def test_sip_device_id_lookup():
         assert init_mod._sip_device_id(hass, "entry_abc") is None
 
 
+def test_contact_refresh_replaces_cache_with_executor_result():
+    if "homeassistant.helpers.service" not in sys.modules:
+        service_stub = types.ModuleType("homeassistant.helpers.service")
+        service_stub.async_extract_config_entry_ids = MagicMock()
+        sys.modules["homeassistant.helpers.service"] = service_stub
+
+    init_mod = _load_component_module("__init__")
+
+    async def run():
+        hass = MagicMock()
+
+        async def executor(func, *args):
+            assert func is init_mod.load_contacts
+            assert args == (hass,)
+            return {"200": {"name": "Front door", "auto_answer": True}}
+
+        hass.async_add_executor_job = executor
+        runtime = {"contacts": {"old": "value"}}
+        await init_mod.async_refresh_contacts(hass, runtime)
+        return runtime["contacts"]
+
+    assert asyncio.run(run()) == {
+        "200": {"name": "Front door", "auto_answer": True}
+    }
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
