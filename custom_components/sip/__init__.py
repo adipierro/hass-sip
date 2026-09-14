@@ -14,6 +14,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.service import async_extract_config_entry_ids
@@ -708,6 +709,14 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 if entry and entry.domain == DOMAIN and entry.state.value == "loaded":
                     matched_entries.append((entry.entry_id, entry.runtime_data))
 
+        has_explicit_target = any(
+            key in call.data
+            for key in ("entity_id", "device_id", "area_id", "floor_id", "label_id")
+        )
+        if not matched_entries and has_explicit_target:
+            LOGGER.warning("SIP service target did not match a loaded SIP account")
+            return []
+
         if not matched_entries:
             # Fallback to the first loaded entry
             loaded_entries = [e for e in entries if e.state.value == "loaded"]
@@ -721,6 +730,38 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 matched_entries.append(
                     (loaded_entries[0].entry_id, loaded_entries[0].runtime_data)
                 )
+
+        context = getattr(call, "context", None)
+        user_id = getattr(context, "user_id", None)
+        if user_id:
+            from homeassistant.auth.permissions.const import POLICY_CONTROL
+
+            user = await hass.auth.async_get_user(user_id)
+            if user is None:
+                from homeassistant.exceptions import UnknownUser
+
+                raise UnknownUser(context=context, user_id=user_id)
+
+            registry = er.async_get(hass)
+            for entry_id, _data in matched_entries:
+                entity_ids = [
+                    entity.entity_id
+                    for entity in er.async_entries_for_config_entry(
+                        registry, entry_id
+                    )
+                    if entity.domain == "media_player" and entity.platform == DOMAIN
+                ]
+                if not any(
+                    user.permissions.check_entity(entity_id, POLICY_CONTROL)
+                    for entity_id in entity_ids
+                ):
+                    from homeassistant.exceptions import Unauthorized
+
+                    raise Unauthorized(
+                        context=context,
+                        permission=POLICY_CONTROL,
+                        user_id=user_id,
+                    )
 
         return matched_entries
 

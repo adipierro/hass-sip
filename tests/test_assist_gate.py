@@ -281,6 +281,120 @@ def test_start_assist_allows_listed_caller():
     assert _rejected_events(hass) == []
 
 
+def test_explicit_unmatched_target_does_not_fall_back_to_first_account():
+    integration = _load_sip_init()
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        integration.async_extract_config_entry_ids = AsyncMock(return_value=set())
+        await handler(
+            types.SimpleNamespace(
+                data={"entity_id": ["media_player.missing_phone_line"]}
+            )
+        )
+        return trigger
+
+    asyncio.run(run()).assert_not_awaited()
+
+
+def test_service_user_must_control_target_phone_line():
+    integration = _load_sip_init()
+
+    class Unauthorized(Exception):
+        def __init__(self, **_kwargs):
+            super().__init__("unauthorized")
+
+    class UnknownUser(Exception):
+        pass
+
+    auth_const = types.ModuleType("homeassistant.auth.permissions.const")
+    auth_const.POLICY_CONTROL = "control"
+    exceptions = types.ModuleType("homeassistant.exceptions")
+    exceptions.Unauthorized = Unauthorized
+    exceptions.UnknownUser = UnknownUser
+    old_auth_const = sys.modules.get("homeassistant.auth.permissions.const")
+    old_exceptions = sys.modules.get("homeassistant.exceptions")
+    sys.modules["homeassistant.auth.permissions.const"] = auth_const
+    sys.modules["homeassistant.exceptions"] = exceptions
+
+    async def run():
+        hass, _trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        user = MagicMock()
+        user.permissions.check_entity.return_value = False
+        hass.auth.async_get_user = AsyncMock(return_value=user)
+        integration.er.async_entries_for_config_entry.return_value = [
+            types.SimpleNamespace(
+                entity_id="media_player.phone_line",
+                domain="media_player",
+                platform="sip",
+            )
+        ]
+        call = types.SimpleNamespace(
+            data={"entity_id": ["media_player.phone_line"]},
+            context=types.SimpleNamespace(user_id="ordinary-user"),
+        )
+        try:
+            await handler(call)
+        except Unauthorized:
+            return
+        raise AssertionError("expected unauthorized service call")
+
+    try:
+        asyncio.run(run())
+    finally:
+        if old_auth_const is None:
+            sys.modules.pop("homeassistant.auth.permissions.const", None)
+        else:
+            sys.modules["homeassistant.auth.permissions.const"] = old_auth_const
+        if old_exceptions is None:
+            sys.modules.pop("homeassistant.exceptions", None)
+        else:
+            sys.modules["homeassistant.exceptions"] = old_exceptions
+
+
+def test_authorized_service_user_can_control_target_phone_line():
+    integration = _load_sip_init()
+
+    auth_const = types.ModuleType("homeassistant.auth.permissions.const")
+    auth_const.POLICY_CONTROL = "control"
+    old_auth_const = sys.modules.get("homeassistant.auth.permissions.const")
+    sys.modules["homeassistant.auth.permissions.const"] = auth_const
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        user = MagicMock()
+        user.permissions.check_entity.return_value = True
+        hass.auth.async_get_user = AsyncMock(return_value=user)
+        integration.er.async_entries_for_config_entry.return_value = [
+            types.SimpleNamespace(
+                entity_id="media_player.phone_line",
+                domain="media_player",
+                platform="sip",
+            )
+        ]
+        await handler(
+            types.SimpleNamespace(
+                data={"entity_id": ["media_player.phone_line"]},
+                context=types.SimpleNamespace(user_id="ordinary-user"),
+            )
+        )
+        return trigger
+
+    try:
+        asyncio.run(run()).assert_awaited_once()
+    finally:
+        if old_auth_const is None:
+            sys.modules.pop("homeassistant.auth.permissions.const", None)
+        else:
+            sys.modules["homeassistant.auth.permissions.const"] = old_auth_const
+
+
 def test_start_assist_pin_mismatch_does_not_start():
     integration = _load_sip_init()
 
@@ -335,4 +449,3 @@ def test_start_assist_pin_ok_starts_assist():
     hass, trigger = asyncio.run(run())
     trigger.assert_awaited_once()
     assert _rejected_events(hass) == []
-
