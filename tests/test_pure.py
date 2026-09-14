@@ -2834,6 +2834,31 @@ def test_rtp_flush_tx_buffer():
     asyncio.run(run())
 
 
+def test_replacing_audio_source_flushes_old_pcm():
+    if sip_client is None:
+        return
+
+    class WaitingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.IN_CALL
+        client.rtp.push_tx_audio(b"old audio")
+        client.play_source(WaitingSource())
+        await asyncio.sleep(0)
+        client.rtp.push_tx_audio(b"queued tail")
+
+        client.play_source(WaitingSource())
+        flushed = bytes(client.rtp._tx_buffer)
+        client.stop_audio(flush=True)
+        await asyncio.sleep(0)
+        return flushed
+
+    assert asyncio.run(run()) == b""
+
+
 def test_rtp_hold_resume_catches_up_timestamp():
     async def run():
         session = rtp_session.RtpSession()

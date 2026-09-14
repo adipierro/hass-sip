@@ -1614,7 +1614,14 @@ class SipClient:
         if not self.in_call:
             _LOGGER.warning("play_source ignored: not in call")
             return
+        replacing = (
+            self._tx_source_task is not None and not self._tx_source_task.done()
+        )
         self._cancel_source()
+        if replacing:
+            # The producer is paced ahead of RTP, so cancellation alone can
+            # leave up to the prebuffer window of the old source queued.
+            self.rtp.flush_tx_buffer()
         self._tx_source_task = self._loop.create_task(self._run_source(source))
 
     def stop_audio(self, *, flush: bool = False) -> None:
