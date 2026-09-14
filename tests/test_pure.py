@@ -709,6 +709,7 @@ def _handle_info_dtmf(state):
             sip_client.SipCallbacks(on_dtmf=got.append),
         )
         client.state = state
+        client._d_call_id = "inbound@example"
         with patch.object(client, "_send_raw") as send:
             client._handle_request(_info_dtmf_request())
         return got, [c.args[0] for c in send.call_args_list]
@@ -729,11 +730,32 @@ def test_info_dtmf_fires_during_call():
 def test_info_dtmf_outside_call_is_answered_but_not_delivered():
     if sip_client is None:
         return
-    # An INFO out of any call still gets its 200 OK, but must not inject a
-    # keypress into IVR menus / automations.
+    # An INFO outside a dialog is rejected and must not inject a keypress into
+    # IVR menus / automations.
     digits, sent = _handle_info_dtmf(sip_client.SipState.REGISTERED)
     assert digits == []
-    assert sent and sent[0].startswith("SIP/2.0 200 OK")
+    assert sent and sent[0].startswith("SIP/2.0 481 ")
+
+
+def test_info_dtmf_from_another_dialog_is_rejected():
+    if sip_client is None:
+        return
+
+    async def run():
+        got = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_dtmf=got.append),
+        )
+        client.state = sip_client.SipState.IN_CALL
+        client._d_call_id = "current@example"
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(_info_dtmf_request())
+        return got, send.call_args.args[0]
+
+    digits, response = asyncio.run(run())
+    assert digits == []
+    assert response.startswith("SIP/2.0 481 ")
 
 
 def test_response_copies_complete_via_chain():
@@ -2197,6 +2219,75 @@ def test_remote_cancel_emits_reason():
     ended, state = asyncio.run(run())
     assert ended == ["remote_cancel"]
     assert state == sip_client.SipState.REGISTERED
+
+
+def test_cancel_from_another_transaction_does_not_end_incoming_call():
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_call_ended=ended.append),
+        )
+        client.registered = True
+        client.state = sip_client.SipState.REGISTERED
+        client._local_ip = "192.0.2.1"
+        invite = _invite_request()
+        wrong_cancel = sm.parse_sip_message(
+            "CANCEL sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKother\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>\r\n"
+            "Call-ID: dlg@example\r\n"
+            "CSeq: 1 CANCEL\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(invite)
+            send.reset_mock()
+            client._handle_request(wrong_cancel)
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args.args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.INCOMING
+    assert response.startswith("SIP/2.0 481 ")
+
+
+def test_bye_from_another_dialog_does_not_end_active_call():
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_call_ended=ended.append),
+        )
+        client.registered = True
+        client.state = sip_client.SipState.IN_CALL
+        client._d_call_id = "current@example"
+        wrong_bye = sm.parse_sip_message(
+            "BYE sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKbye\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>;tag=local\r\n"
+            "Call-ID: other@example\r\n"
+            "CSeq: 2 BYE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(wrong_bye)
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args.args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.IN_CALL
+    assert response.startswith("SIP/2.0 481 ")
 
 
 def test_ring_timeout_emits_reason():

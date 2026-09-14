@@ -1239,6 +1239,31 @@ class SipClient:
             return
         self._send_raw(self._build_response(m, 200, "OK", False))
 
+    def _is_current_dialog_request(self, m: sm.SipMessage) -> bool:
+        """Return whether an in-dialog request belongs to the active call."""
+        return bool(
+            self._d_call_id
+            and m.header("Call-ID") == self._d_call_id
+            and self.state in (SipState.IN_CALL, SipState.ANSWERING)
+        )
+
+    def _cancel_matches_invite(self, m: sm.SipMessage) -> bool:
+        """Return whether CANCEL matches the pending initial INVITE transaction."""
+        invite = self._incoming_invite
+        if self.state != SipState.INCOMING or invite is None:
+            return False
+        cancel_cseq = _cseq_number(m.header("CSeq"))
+        invite_cseq = _cseq_number(invite.header("CSeq"))
+        cancel_branch = _via_branch(m.header("Via"))
+        invite_branch = _via_branch(invite.header("Via"))
+        return bool(
+            m.header("Call-ID") == invite.header("Call-ID")
+            and cancel_cseq > 0
+            and cancel_cseq == invite_cseq
+            and cancel_branch
+            and cancel_branch == invite_branch
+        )
+
     def _handle_request(self, m: sm.SipMessage) -> None:
         method = m.method
         if method == "INVITE":
@@ -1327,31 +1352,49 @@ class SipClient:
             return
 
         if method == "BYE":
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             _LOGGER.info("Remote hung up")
             self._end_call("remote_bye")
             return
 
         if method == "CANCEL":
-            self._send_raw(self._build_response(m, 200, "OK", False))
-            if self.state == SipState.INCOMING and self._incoming_invite is not None:
+            if not self._cancel_matches_invite(m):
                 self._send_raw(
-                    self._build_response(self._incoming_invite, 487, "Request Terminated", False)
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
                 )
-                self._end_call("remote_cancel")
+                return
+            self._send_raw(self._build_response(m, 200, "OK", False))
+            assert self._incoming_invite is not None
+            self._send_raw(
+                self._build_response(
+                    self._incoming_invite, 487, "Request Terminated", False
+                )
+            )
+            self._end_call("remote_cancel")
             return
 
         if method == "INFO":
             # Many ATAs / gateways signal DTMF out-of-band via SIP INFO instead
             # of RFC 2833 telephone-event packets.
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             digit = _parse_info_dtmf(m.header("Content-Type"), m.body)
             if digit is None:
-                return
-            # A keypress only means something inside a call. ANSWERING counts:
-            # the INFO can arrive before the ACK that moves us to IN_CALL.
-            if self.state not in (SipState.IN_CALL, SipState.ANSWERING):
-                _LOGGER.debug("DTMF '%s' via SIP INFO ignored in state %s", digit, self.state)
                 return
             _LOGGER.debug("DTMF '%s' received via SIP INFO", digit)
             self._on_rx_dtmf(digit)
