@@ -371,6 +371,150 @@ def test_ffmpeg_source_requires_exactly_one_input():
         raise AssertionError("expected ValueError")
 
 
+def test_ffmpeg_source_raises_with_bounded_stderr_on_decoder_failure():
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "sys.stderr.write('media request failed: 401 Unauthorized\\n')\n"
+        "raise SystemExit(1)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            assert "401 Unauthorized" in str(err)
+        else:
+            raise AssertionError("expected ffmpeg failure")
+    finally:
+        os.unlink(path)
+
+
+def test_ffmpeg_source_rejects_successful_empty_output():
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "sys.stderr.write('Server returned 401 Unauthorized\\n')\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            assert "produced no audio" in str(err)
+            # exit 0 with no PCM still carries ffmpeg's diagnostics
+            assert "401 Unauthorized" in str(err)
+        else:
+            raise AssertionError("expected empty-output failure")
+    finally:
+        os.unlink(path)
+
+
+def test_ffmpeg_source_stderr_tail_is_bounded():
+    limit = audio._FFMPEG_STDERR_LIMIT
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        f"sys.stderr.write('HEAD' + 'x' * {limit * 2} + 'TAIL')\n"
+        "raise SystemExit(1)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            msg = str(err)
+            assert msg.endswith("TAIL")
+            assert "HEAD" not in msg
+            assert len(msg) <= limit + len("ffmpeg exited with status 1: ")
+        else:
+            raise AssertionError("expected ffmpeg failure")
+    finally:
+        os.unlink(path)
+
+
+def test_ffmpeg_source_caller_stop_is_not_a_failure():
+    """A source ended by is_active() -> False (hangup, stop_audio) must
+    return quietly: the nonzero exit status comes from our own kill."""
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys, time\n"
+        "out = sys.stdout.buffer\n"
+        "while True:\n"
+        "    out.write(b'\\x00' * 320)\n"
+        "    out.flush()\n"
+        "    time.sleep(0.005)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    pushed: list[bytes] = []
+    polls = 0
+
+    def is_active():
+        nonlocal polls
+        polls += 1
+        return polls <= 3
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        source.configure(8000, 320)
+        await asyncio.wait_for(source.run(pushed.append, is_active), timeout=5)
+
+    try:
+        asyncio.run(main())  # must not raise
+    finally:
+        os.unlink(path)
+    assert pushed
+
+
+def test_failed_audio_source_does_not_emit_playback_done():
+    if sip_client is None:
+        return
+
+    class FailingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            raise RuntimeError("decoder failed")
+
+    async def main():
+        completed = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_playback_done=lambda: completed.append(True)),
+        )
+        client.state = sip_client.SipState.IN_CALL
+        await client._run_source(FailingSource())
+        return completed
+
+    assert asyncio.run(main()) == []
+
+
 def test_ffmpeg_source_streaming_emits_pcm_before_producer_finishes():
     """First stdout PCM must not wait for the stdin iterable to be exhausted."""
     script = (
@@ -709,6 +853,7 @@ def _handle_info_dtmf(state):
             sip_client.SipCallbacks(on_dtmf=got.append),
         )
         client.state = state
+        client._d_call_id = "inbound@example"
         with patch.object(client, "_send_raw") as send:
             client._handle_request(_info_dtmf_request())
         return got, [c.args[0] for c in send.call_args_list]
@@ -729,11 +874,32 @@ def test_info_dtmf_fires_during_call():
 def test_info_dtmf_outside_call_is_answered_but_not_delivered():
     if sip_client is None:
         return
-    # An INFO out of any call still gets its 200 OK, but must not inject a
-    # keypress into IVR menus / automations.
+    # An INFO outside a dialog is rejected and must not inject a keypress into
+    # IVR menus / automations.
     digits, sent = _handle_info_dtmf(sip_client.SipState.REGISTERED)
     assert digits == []
-    assert sent and sent[0].startswith("SIP/2.0 200 OK")
+    assert sent and sent[0].startswith("SIP/2.0 481 ")
+
+
+def test_info_dtmf_from_another_dialog_is_rejected():
+    if sip_client is None:
+        return
+
+    async def run():
+        got = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_dtmf=got.append),
+        )
+        client.state = sip_client.SipState.IN_CALL
+        client._d_call_id = "current@example"
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(_info_dtmf_request())
+        return got, send.call_args.args[0]
+
+    digits, response = asyncio.run(run())
+    assert digits == []
+    assert response.startswith("SIP/2.0 481 ")
 
 
 def test_response_copies_complete_via_chain():
@@ -2199,6 +2365,194 @@ def test_remote_cancel_emits_reason():
     assert state == sip_client.SipState.REGISTERED
 
 
+def test_cancel_from_another_transaction_does_not_end_incoming_call():
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_call_ended=ended.append),
+        )
+        client.registered = True
+        client.state = sip_client.SipState.REGISTERED
+        client._local_ip = "192.0.2.1"
+        invite = _invite_request()
+        wrong_cancel = sm.parse_sip_message(
+            "CANCEL sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKother\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>\r\n"
+            "Call-ID: dlg@example\r\n"
+            "CSeq: 1 CANCEL\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(invite)
+            send.reset_mock()
+            client._handle_request(wrong_cancel)
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args.args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.INCOMING
+    assert response.startswith("SIP/2.0 481 ")
+
+
+def test_bye_from_another_dialog_does_not_end_active_call():
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_call_ended=ended.append),
+        )
+        client.registered = True
+        client.state = sip_client.SipState.IN_CALL
+        client._d_call_id = "current@example"
+        wrong_bye = sm.parse_sip_message(
+            "BYE sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKbye\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>;tag=local\r\n"
+            "Call-ID: other@example\r\n"
+            "CSeq: 2 BYE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(wrong_bye)
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args.args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.IN_CALL
+    assert response.startswith("SIP/2.0 481 ")
+
+
+def _ringing_inbound(ended):
+    """Inbound INVITE handled, still ringing (INCOMING); returns (client, invite)."""
+    client = sip_client.SipClient(
+        sip_client.SipConfig(server="pbx.example"),
+        sip_client.SipCallbacks(on_call_ended=ended.append),
+    )
+    client.registered = True
+    client.state = sip_client.SipState.REGISTERED
+    client._local_ip = "192.0.2.1"
+    invite = _invite_request()
+    with patch.object(client, "_send_raw"):
+        client._handle_request(invite)
+    assert client.state == sip_client.SipState.INCOMING
+    return client, invite
+
+
+def test_bye_while_ringing_ends_incoming_call():
+    """A caller may BYE an early dialog (RFC 3261 §15): the bell must stop."""
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client, invite = _ringing_inbound(ended)
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(_bye_request(invite.header("Call-ID")))
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args_list[0].args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == ["remote_bye"]
+    assert state == sip_client.SipState.REGISTERED
+    assert response.startswith("SIP/2.0 200 OK")
+
+
+def test_info_in_early_dialog_is_acknowledged_but_dtmf_not_delivered():
+    """Our own early dialog: 200 (not 481, which would tear the dialog down)
+    but a keypress before the call is connected is still dropped."""
+    if sip_client is None:
+        return
+
+    async def run():
+        got = []
+        client = sip_client.SipClient(
+            sip_client.SipConfig(server="pbx.example"),
+            sip_client.SipCallbacks(on_dtmf=got.append),
+        )
+        client.state = sip_client.SipState.INCOMING
+        client._d_call_id = "inbound@example"
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(_info_dtmf_request())
+        return got, send.call_args.args[0]
+
+    digits, response = asyncio.run(run())
+    assert digits == []
+    assert response.startswith("SIP/2.0 200 OK")
+
+
+def test_cancel_after_answer_is_acknowledged_without_ending_call():
+    """CANCEL racing our 200 OK: the INVITE transaction still exists, so it
+    gets 200, but the call stays up (RFC 3261 §9.2)."""
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client, invite = _ringing_inbound(ended)
+        with patch.object(client, "_send_raw"):
+            client.answer()
+        assert client.state == sip_client.SipState.ANSWERING
+        cancel = sm.parse_sip_message(
+            "CANCEL sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKorig\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>\r\n"
+            "Call-ID: dlg@example\r\n"
+            "CSeq: 1 CANCEL\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(cancel)
+            await asyncio.sleep(0)
+        sent = [c.args[0] for c in send.call_args_list]
+        client._cancel_source()
+        return ended, client.state, sent
+
+    ended, state, sent = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.ANSWERING
+    assert sent == [sent[0]] and sent[0].startswith("SIP/2.0 200 OK")
+
+
+def test_cancel_with_other_call_id_is_rejected():
+    if sip_client is None:
+        return
+
+    async def run():
+        ended = []
+        client, _invite = _ringing_inbound(ended)
+        cancel = sm.parse_sip_message(
+            "CANCEL sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP pbx.example;branch=z9hG4bKorig\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>\r\n"
+            "Call-ID: other@example\r\n"
+            "CSeq: 1 CANCEL\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(cancel)
+            await asyncio.sleep(0)
+        return ended, client.state, send.call_args.args[0]
+
+    ended, state, response = asyncio.run(run())
+    assert ended == []
+    assert state == sip_client.SipState.INCOMING
+    assert response.startswith("SIP/2.0 481 ")
+
+
 def test_ring_timeout_emits_reason():
     if sip_client is None:
         return
@@ -2832,6 +3186,91 @@ def test_rtp_flush_tx_buffer():
         assert not session._tx_buffer
 
     asyncio.run(run())
+
+
+def test_replaced_audio_source_is_retained_until_cancel_cleanup_finishes():
+    if sip_client is None:
+        return
+
+    class CleanupSource(audio.AudioSource):
+        def __init__(self, cleanup_started, cleanup_finished):
+            self.cleanup_started = cleanup_started
+            self.cleanup_finished = cleanup_finished
+
+        async def run(self, push, is_active):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleanup_started.set()
+                await self.cleanup_finished.wait()
+
+    class WaitingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.IN_CALL
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        client.play_source(CleanupSource(cleanup_started, cleanup_finished))
+        old_task = client._tx_source_task
+        await asyncio.sleep(0)
+
+        client.play_source(WaitingSource())
+        await cleanup_started.wait()
+        assert old_task in client._tx_source_tasks
+        assert not old_task.done()
+
+        cleanup_finished.set()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        assert old_task not in client._tx_source_tasks
+
+        client.stop_audio(flush=True)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_replacing_audio_source_flushes_old_pcm():
+    if sip_client is None:
+        return
+
+    class WaitingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.IN_CALL
+        # push_tx_audio() is a no-op without a transport; give it one so the
+        # buffer really fills and the flush is what empties it.
+        client.rtp._transport = object()
+
+        # No live source: leftover PCM is kept (not a replacement).
+        client.rtp.push_tx_audio(b"old audio")
+        client.play_source(WaitingSource())
+        kept = bytes(client.rtp._tx_buffer)
+        await asyncio.sleep(0)
+
+        # Live source: its queued prebuffer must go when it is replaced.
+        client.rtp.push_tx_audio(b"queued tail")
+        before = bytes(client.rtp._tx_buffer)
+        client.play_source(WaitingSource())
+        after = bytes(client.rtp._tx_buffer)
+
+        client.stop_audio(flush=True)
+        await asyncio.sleep(0)
+        return kept, before, after
+
+    kept, before, after = asyncio.run(run())
+    assert kept == b"old audio"
+    assert before == b"old audioqueued tail"
+    assert after == b""
 
 
 def test_rtp_hold_resume_catches_up_timestamp():
@@ -3791,7 +4230,10 @@ def test_start_assist_service_accepts_and_forwards_prompts():
             if call.args[:2] == ("sip", "start_assist")
         )
         handler = registration.args[2]
-        await handler(types.SimpleNamespace(data=service_data))
+        call = types.SimpleNamespace(
+            data=service_data, context=types.SimpleNamespace(user_id=None)
+        )
+        await handler(call)
 
     asyncio.run(run_service())
     trigger_assist.assert_awaited_once_with(
@@ -5091,6 +5533,92 @@ def test_sip_device_id_lookup():
 
         mock_dr.async_get_device_by_identifier.return_value = None
         assert init_mod._sip_device_id(hass, "entry_abc") is None
+
+
+def _load_init_for_contacts():
+    _assist_ctx()  # __init__ imports assist/*; make the stubs order-independent
+    if "homeassistant.helpers.service" not in sys.modules:
+        service_stub = types.ModuleType("homeassistant.helpers.service")
+        service_stub.async_extract_config_entry_ids = MagicMock()
+        sys.modules["homeassistant.helpers.service"] = service_stub
+    return _load_component_module("__init__")
+
+
+def _contacts_hass(tmp_dir):
+    hass = MagicMock()
+    hass.config.path.return_value = tmp_dir
+
+    async def executor(func, *args):
+        return func(*args)
+
+    hass.async_add_executor_job = executor
+    return hass
+
+
+def test_contact_refresh_replaces_cache_with_executor_result():
+    init_mod = _load_init_for_contacts()
+
+    async def run():
+        hass = MagicMock()
+
+        async def executor(func, *args):
+            assert func is init_mod.load_contacts
+            assert args == (hass,)
+            return {"200": {"name": "Front door", "auto_answer": True}}
+
+        hass.async_add_executor_job = executor
+        runtime = {"contacts": {"old": "value"}}
+        await init_mod.async_refresh_contacts(hass, runtime)
+        return runtime["contacts"]
+
+    assert asyncio.run(run()) == {
+        "200": {"name": "Front door", "auto_answer": True}
+    }
+
+
+def test_contact_refresh_keeps_cache_while_file_is_unparseable():
+    """A half-written / invalid sip_contacts.json must not wipe auto-answer."""
+    init_mod = _load_init_for_contacts()
+    good = {"200": {"name": "Front door", "auto_answer": True}}
+
+    async def run(tmp_dir):
+        hass = _contacts_hass(tmp_dir)
+        path = os.path.join(tmp_dir, "sip_contacts.json")
+        runtime = {"contacts": dict(good)}
+        with patch.object(init_mod.LOGGER, "warning") as warn:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"200": {"name": "Fr')  # editor mid-save
+            await init_mod.async_refresh_contacts(hass, runtime)
+            await init_mod.async_refresh_contacts(hass, runtime)
+            kept = runtime["contacts"]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("[1, 2]")  # valid JSON, not an object
+            await init_mod.async_refresh_contacts(hass, runtime)
+            kept_list = runtime["contacts"]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"201": "Gate"}')
+            await init_mod.async_refresh_contacts(hass, runtime)
+            return kept, kept_list, runtime["contacts"], warn.call_count
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        kept, kept_list, after, warnings = asyncio.run(run(tmp_dir))
+    assert kept == good
+    assert kept_list == good
+    assert after == {"201": "Gate"}
+    assert warnings == 1  # once per outage, not once per tick
+
+
+def test_contact_refresh_empties_cache_when_file_removed():
+    init_mod = _load_init_for_contacts()
+
+    async def run(tmp_dir):
+        hass = _contacts_hass(tmp_dir)
+        runtime = {"contacts": {"200": "Front door"}}
+        await init_mod.async_refresh_contacts(hass, runtime)
+        return runtime["contacts"]
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        assert asyncio.run(run(tmp_dir)) == {}
 
 
 if __name__ == "__main__":
