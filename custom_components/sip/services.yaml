@@ -284,6 +284,13 @@ start_assist:
       default: false
       selector:
         boolean:
+    interrupt_media:
+      name: Interrupt media
+      description: Stop and discard current media playback before Assist starts. Disable to wait for playback to finish.
+      required: false
+      default: true
+      selector:
+        boolean:
     allowed_callers:
       name: Allowed callers
       description: Caller IDs that may start Assist. Omitted means no restriction. Caller ID can be spoofed; pair with PIN for door-lock intents.

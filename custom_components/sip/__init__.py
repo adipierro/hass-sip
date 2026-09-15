@@ -211,6 +211,7 @@ SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
         ),
         vol.Optional("turn_tone"): cv.boolean,
         vol.Optional("hangup_on_end"): cv.boolean,
+        vol.Optional("interrupt_media", default=True): cv.boolean,
         vol.Optional("allowed_callers"): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional("contacts_only"): cv.boolean,
         vol.Optional("pin"): cv.string,
@@ -557,11 +558,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
+        interrupt_media: bool = True,
     ) -> None:
         nonlocal assist_bridge
         if assist_bridge is not None:
             client.remove_sink(assist_bridge)
             assist_bridge.close()
+
+        if interrupt_media:
+            # Sources are paced ahead into RTP, so flush as well as cancel to
+            # let Assist listen or play its opening response immediately.
+            client.stop_audio(flush=True)
 
         bridge = AssistBridge(
             hass,
@@ -965,6 +972,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "noise_suppression",
                 "turn_tone",
                 "hangup_on_end",
+                "interrupt_media",
             )
             if k in call.data
         }

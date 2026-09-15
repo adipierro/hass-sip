@@ -3769,6 +3769,7 @@ def test_start_assist_service_accepts_and_forwards_prompts():
     assert service_data["conversation_id"] == "existing-conversation"
     assert service_data["initial_prompt"] == "Greet the caller"
     assert service_data["system_prompt"] == "Keep answers concise"
+    assert service_data["interrupt_media"] is True
 
     trigger_assist = AsyncMock()
     entry = MagicMock()
@@ -3797,6 +3798,7 @@ def test_start_assist_service_accepts_and_forwards_prompts():
         conversation_id="existing-conversation",
         initial_prompt="Greet the caller",
         system_prompt="Keep answers concise",
+        interrupt_media=True,
     )
 
 

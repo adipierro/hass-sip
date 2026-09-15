@@ -272,6 +272,10 @@
           "name": "Bei Ende auflegen",
           "description": "Anruf beenden, wenn die Assist-Sitzung endet."
         },
+        "interrupt_media": {
+          "name": "Medienwiedergabe unterbrechen",
+          "description": "Aktuelle Medienwiedergabe vor dem Start von Assist stoppen und verwerfen. Deaktivieren, um auf das Ende der Wiedergabe zu warten."
+        },
         "allowed_callers": {
           "name": "Erlaubte Anrufer",
           "description": "Anrufer-IDs, die Assist starten dürfen. Ohne Angabe keine Einschränkung. Caller-ID ist fälschbar; für Türschloss-Intents zusätzlich PIN verwenden."

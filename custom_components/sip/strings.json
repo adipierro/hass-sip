@@ -272,6 +272,10 @@
           "name": "Hang up on end",
           "description": "Hang up the call when the Assist session ends."
         },
+        "interrupt_media": {
+          "name": "Interrupt media",
+          "description": "Stop and discard current media playback before Assist starts. Disable to wait for playback to finish."
+        },
         "allowed_callers": {
           "name": "Allowed callers",
           "description": "Caller IDs that may start Assist. Omitted means no restriction. Caller ID can be spoofed; pair with PIN for door-lock intents."

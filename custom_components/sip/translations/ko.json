@@ -272,6 +272,10 @@
           "name": "종료 시 끊기",
           "description": "Assist 세션 종료 시 통화를 끊습니다."
         },
+        "interrupt_media": {
+          "name": "미디어 중단",
+          "description": "Assist 시작 전에 현재 미디어 재생을 중지하고 버립니다. 재생이 끝날 때까지 기다리려면 비활성화하세요."
+        },
         "allowed_callers": {
           "name": "허용 발신자",
           "description": "Assist를 시작할 수 있는 발신자 번호. 생략하면 제한 없음. Caller ID는 스푸핑될 수 있으므로 도어락 intent에는 PIN을 함께 쓰세요."
