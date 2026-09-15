@@ -208,7 +208,7 @@ class AssistBridge(AudioSink):
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
-        interrupt_media: bool = False,
+        interrupt_media: bool = True,
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
         user_id: str | None = None,

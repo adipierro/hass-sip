@@ -274,7 +274,7 @@
         },
         "interrupt_media": {
           "name": "Interrupt media",
-          "description": "Stop and discard current media playback when Assist is ready to listen or play its first response. Media may continue during pipeline, LLM, and TTS warm-up."
+          "description": "Stop and discard current media playback when Assist is ready to listen or play its first response. Media may continue during pipeline, LLM, and TTS warm-up. Set to false to let the current playback finish before Assist's first turn."
         },
         "allowed_callers": {
           "name": "Allowed callers",
