@@ -4156,6 +4156,8 @@ def test_assist_initial_prompt_waits_for_tts_before_listening():
 
 def test_assist_initial_prompt_barge_in_becomes_first_turn_preroll():
     assist_mod, mock_ap, PET, PE = _assist_ctx()
+    original_grace = assist_mod._BARGE_IN_VAD_GRACE_SECONDS
+    assist_mod._BARGE_IN_VAD_GRACE_SECONDS = 0
     mock_tts = sys.modules["homeassistant.components.tts"]
     original_get_stream = mock_tts.async_get_stream.return_value
     original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
@@ -4222,6 +4224,7 @@ def test_assist_initial_prompt_barge_in_becomes_first_turn_preroll():
         mock_tts.async_get_stream.return_value = original_get_stream
         assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
         assist_mod.MicroVad = original_micro_vad
+        assist_mod._BARGE_IN_VAD_GRACE_SECONDS = original_grace
 
     stop_audio.assert_called_once_with(flush=True)
     assert preroll_queue_sizes[0] > 0
@@ -5057,6 +5060,56 @@ def test_assist_barge_in_triggers_stop_and_preroll():
         assist_mod.MicroVad = original_micro_vad
 
 
+def test_assist_barge_in_vad_waits_for_echo_canceller_grace_period():
+    assist_mod, _, _, _ = _assist_ctx()
+    original_micro_vad = assist_mod.MicroVad
+
+    class _StubVad:
+        def Process10ms(self, frame: bytes) -> float:
+            return 0.9
+
+    assist_mod.MicroVad = lambda: _StubVad()
+    try:
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            barge_in=True,
+        )
+        bridge._speaking = True
+        with patch.object(assist_mod.time, "monotonic", return_value=100.0):
+            bridge._tts_armed_at = assist_mod.time.monotonic()
+            frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
+            for _ in range(50):
+                bridge.write(frame)
+        assert bridge._post_barge_in_capture is False
+        assert bridge._vad_speech_frames == 0
+    finally:
+        assist_mod.MicroVad = original_micro_vad
+
+
+def test_assist_barge_in_grace_starts_when_tts_playback_starts():
+    """Grace is armed when TTS is sent to the SIP client."""
+    assist_mod, _, _, _ = _assist_ctx()
+    stream = MagicMock()
+
+    async def one_chunk():
+        yield b"RIFF...."
+
+    stream.async_stream_result = one_chunk
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(), play_source_fn=MagicMock(), on_done_fn=MagicMock()
+        )
+        with patch.object(assist_mod.time, "monotonic", return_value=100.0):
+            await bridge._play_tts_stream(stream, epoch=0)
+        assert bridge._tts_armed_at == 100.0
+        bridge.close()
+
+    asyncio.run(run())
+
+
 def test_assist_barge_in_disabled_without_micro_vad():
     assist_mod, _, _, _ = _assist_ctx()
     original_micro_vad = assist_mod.MicroVad
@@ -5085,6 +5138,7 @@ def test_assist_barge_in_cancels_inflight_tts():
     mock_tts = sys.modules["homeassistant.components.tts"]
     original_get_stream = mock_tts.async_get_stream.return_value
     original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
+    original_grace = assist_mod._BARGE_IN_VAD_GRACE_SECONDS
     original_micro_vad = assist_mod.MicroVad
     play_calls = []
 
@@ -5094,6 +5148,7 @@ def test_assist_barge_in_cancels_inflight_tts():
 
     assist_mod.MicroVad = lambda: _StubVad()
     assist_mod._VAD_MIN_SPEECH_FRAMES = 2
+    assist_mod._BARGE_IN_VAD_GRACE_SECONDS = 0
 
     async def slow_stream():
         await asyncio.sleep(0.15)
@@ -5134,6 +5189,7 @@ def test_assist_barge_in_cancels_inflight_tts():
         assert not play_calls
     finally:
         assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
+        assist_mod._BARGE_IN_VAD_GRACE_SECONDS = original_grace
         assist_mod.MicroVad = original_micro_vad
         mock_tts.async_get_stream.return_value = original_get_stream
 

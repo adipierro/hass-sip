@@ -4,6 +4,7 @@ from __future__ import annotations
 import array
 import asyncio
 import math
+import time
 from collections.abc import AsyncIterable, Callable
 from typing import Literal
 
@@ -48,6 +49,7 @@ _ERROR_TURN_BACKOFF_SECONDS = 1.0
 _VAD_FRAME_BYTES = 320  # 10 ms @ 16 kHz s16le mono
 _VAD_SPEECH_THRESHOLD = 0.5
 _VAD_MIN_SPEECH_FRAMES = 30  # 300 ms consecutive speech
+_BARGE_IN_VAD_GRACE_SECONDS = 2.0
 # Shorter than barge-in: a 100 ms utterance after TTS must still count.
 _GAP_MIN_SPEECH_FRAMES = 5  # 50 ms consecutive speech
 _PREROLL_MAX_BYTES = 16000  # 500 ms @ 16 kHz s16le mono
@@ -270,6 +272,7 @@ class AssistBridge(AudioSink):
         self._gap_pending = bytearray()
         self._gap_speech_frames = 0
         self._gap_has_speech = False
+        self._tts_armed_at: float | None = None
 
     def start(self) -> None:
         """Start the Assist session loop in the background."""
@@ -419,6 +422,15 @@ class AssistBridge(AudioSink):
     def _monitor_barge_in(self, pcm_16k: bytes) -> None:
         """Detect caller speech during TTS playback and trigger barge-in."""
         self._append_rx_to_ring(pcm_16k)
+        if (
+            self._tts_armed_at is not None
+            and time.monotonic() - self._tts_armed_at < _BARGE_IN_VAD_GRACE_SECONDS
+        ):
+            # Let the phone's echo canceller adapt to the new downlink signal
+            # before treating received audio as caller speech.
+            self._vad_pending.clear()
+            self._vad_speech_frames = 0
+            return
 
         self._vad_pending.extend(pcm_16k)
         while len(self._vad_pending) >= _VAD_FRAME_BYTES:
@@ -815,6 +827,7 @@ class AssistBridge(AudioSink):
             source = FfmpegAudioSource(
                 chunks=chunks(), ffmpeg_bin=get_ffmpeg_bin(self.hass)
             )
+            self._tts_armed_at = time.monotonic()
             self.play_source(source)
             self._tx_wait = "tts"
         except asyncio.CancelledError:
