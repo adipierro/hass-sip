@@ -1242,6 +1242,42 @@ class SipClient:
             return
         self._send_raw(self._build_response(m, 200, "OK", False))
 
+    def _is_current_dialog_request(self, m: sm.SipMessage) -> bool:
+        """Return whether an in-dialog request belongs to our current dialog.
+
+        Early dialogs count: _d_call_id is set when the INVITE is received
+        (INCOMING) or sent (INVITING), and a caller may BYE a ringing call.
+        Replying 481 to a request that *is* in our dialog would make the
+        remote tear the dialog down (RFC 3261 §12.2.1.2).
+        """
+        return bool(
+            self._d_call_id
+            and m.header("Call-ID") == self._d_call_id
+            and self.state in _DIALOG_STATES
+        )
+
+    def _cancel_matches_invite(self, m: sm.SipMessage) -> bool:
+        """Return whether CANCEL matches the pending initial INVITE transaction.
+
+        The INVITE server transaction lives until the ACK, so this also
+        matches in ANSWERING (200 sent); the caller decides whether a match
+        still cancels anything.
+        """
+        invite = self._incoming_invite
+        if self.state not in (SipState.INCOMING, SipState.ANSWERING) or invite is None:
+            return False
+        cancel_cseq = _cseq_number(m.header("CSeq"))
+        invite_cseq = _cseq_number(invite.header("CSeq"))
+        cancel_branch = _via_branch(m.header("Via"))
+        invite_branch = _via_branch(invite.header("Via"))
+        return bool(
+            m.header("Call-ID") == invite.header("Call-ID")
+            and cancel_cseq > 0
+            and cancel_cseq == invite_cseq
+            and cancel_branch
+            and cancel_branch == invite_branch
+        )
+
     def _handle_request(self, m: sm.SipMessage) -> None:
         method = m.method
         if method == "INVITE":
@@ -1330,23 +1366,51 @@ class SipClient:
             return
 
         if method == "BYE":
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             _LOGGER.info("Remote hung up")
             self._end_call("remote_bye")
             return
 
         if method == "CANCEL":
-            self._send_raw(self._build_response(m, 200, "OK", False))
-            if self.state == SipState.INCOMING and self._incoming_invite is not None:
+            if not self._cancel_matches_invite(m):
                 self._send_raw(
-                    self._build_response(self._incoming_invite, 487, "Request Terminated", False)
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
                 )
-                self._end_call("remote_cancel")
+                return
+            self._send_raw(self._build_response(m, 200, "OK", False))
+            if self.state != SipState.INCOMING:
+                # Already answered (200 OK sent, awaiting ACK): the CANCEL
+                # matches the transaction but arrived too late to act on.
+                _LOGGER.debug("CANCEL after 200 OK ignored")
+                return
+            assert self._incoming_invite is not None
+            self._send_raw(
+                self._build_response(
+                    self._incoming_invite, 487, "Request Terminated", False
+                )
+            )
+            self._end_call("remote_cancel")
             return
 
         if method == "INFO":
             # Many ATAs / gateways signal DTMF out-of-band via SIP INFO instead
             # of RFC 2833 telephone-event packets.
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             digit = _parse_info_dtmf(m.header("Content-Type"), m.body)
             if digit is None:
@@ -1617,7 +1681,11 @@ class SipClient:
         if not self.in_call:
             _LOGGER.warning("play_source ignored: not in call")
             return
-        self._cancel_source()
+        # Replacing a live source: the producer is paced ahead of RTP, so
+        # cancellation alone can leave up to the prebuffer window of the old
+        # source queued. PCM left over from an already-finished source is
+        # deliberately kept (stop_audio(flush=False) then play_source()).
+        self.stop_audio(flush=self.media_playing)
         task = self._loop.create_task(self._run_source(source))
         self._tx_source_task = task
         self._tx_source_tasks.add(task)

@@ -11,13 +11,13 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
+    async_process_play_media_url,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.network import get_url
 
 from .const import DOMAIN, LOGGER
 from .helpers import build_device_info, get_ffmpeg_bin
@@ -181,17 +181,17 @@ class SipMediaPlayer(MediaPlayerEntity):
                     f"Failed to resolve media source '{media_id}': {err}"
                 ) from err
 
-        # Prepend the base URL for relative paths (local media / TTS proxy).
-        if url.startswith("/"):
-            try:
-                url = get_url(self.hass) + url
-            except Exception as err:
-                raise HomeAssistantError(
-                    f"Failed to resolve a base URL for '{url}'. Set an internal "
-                    f"URL in Home Assistant network settings: {err}"
-                ) from err
+        # Make Home Assistant URLs absolute and sign protected paths such as
+        # /media.  ffmpeg is a separate process and has no HA login session.
+        try:
+            url = async_process_play_media_url(self.hass, url)
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Failed to prepare media URL '{url}': {err}"
+            ) from err
 
-        LOGGER.info("Streaming media to SIP call: %s", url)
+        # A prepared HA URL may carry an authSig. Never put it in the log.
+        LOGGER.info("Streaming media to SIP call: %s", url.partition("?")[0])
         source = FfmpegAudioSource(url=url, ffmpeg_bin=get_ffmpeg_bin(self.hass))
         self._client.play_source(source)
         self.async_write_ha_state()

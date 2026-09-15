@@ -175,11 +175,17 @@ class IvrSession:
         self._reset_timeout()
 
     def _reset_timeout(self) -> None:
+        self._cancel_timeout()
+        if not self.is_active:
+            return
+        timeout_sec = self.current_menu.get("timeout", 10)
+        self.timeout_task = asyncio.create_task(self._timeout_timer(timeout_sec))
+
+    def _cancel_timeout(self) -> None:
+        """Cancel the pending input timeout without arming another one."""
         if self.timeout_task:
             self.timeout_task.cancel()
             self.timeout_task = None
-        timeout_sec = self.current_menu.get("timeout", 10)
-        self.timeout_task = asyncio.create_task(self._timeout_timer(timeout_sec))
 
     async def _timeout_timer(self, seconds: float) -> None:
         try:
@@ -305,4 +311,4 @@ class IvrSession:
         """Close the IVR session and clean up resources."""
         self.is_active = False
         self.waiting_for_dtmf = False
-        self._reset_timeout()
+        self._cancel_timeout()
