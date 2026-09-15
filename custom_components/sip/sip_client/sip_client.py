@@ -307,6 +307,9 @@ class SipClient:
         self.rtp.on_media_timeout = self._on_media_timeout
         self.sink: AudioSink = TeeSink()
         self._tx_source_task: asyncio.Task | None = None
+        # A cancelled source may still be cleaning up an ffmpeg subprocess.
+        # Keep it alive until that cleanup has actually completed.
+        self._tx_source_tasks: set[asyncio.Task] = set()
         self._pending_source: AudioSource | None = None
         self._ring_timeout_handle: asyncio.TimerHandle | None = None
         self._max_duration_handle: asyncio.TimerHandle | None = None
@@ -1683,7 +1686,10 @@ class SipClient:
         # source queued. PCM left over from an already-finished source is
         # deliberately kept (stop_audio(flush=False) then play_source()).
         self.stop_audio(flush=self.media_playing)
-        self._tx_source_task = self._loop.create_task(self._run_source(source))
+        task = self._loop.create_task(self._run_source(source))
+        self._tx_source_task = task
+        self._tx_source_tasks.add(task)
+        task.add_done_callback(self._tx_source_tasks.discard)
 
     def stop_audio(self, *, flush: bool = False) -> None:
         """Stop the current TX audio source; optionally discard queued RTP PCM."""
