@@ -494,7 +494,10 @@ def test_ffmpeg_source_caller_stop_is_not_a_failure():
     assert pushed
 
 
-def test_failed_audio_source_does_not_emit_playback_done():
+def test_failed_audio_source_emits_playback_error_not_done():
+    """A failed source must not look like a finished one, but consumers
+    blocked on completion (IVR, Assist, wait-for-playback automations)
+    still need a signal to move on."""
     if sip_client is None:
         return
 
@@ -504,15 +507,39 @@ def test_failed_audio_source_does_not_emit_playback_done():
 
     async def main():
         completed = []
+        errors = []
         client = sip_client.SipClient(
             sip_client.SipConfig(server="pbx.example"),
-            sip_client.SipCallbacks(on_playback_done=lambda: completed.append(True)),
+            sip_client.SipCallbacks(
+                on_playback_done=lambda: completed.append(True),
+                on_playback_error=errors.append,
+            ),
         )
         client.state = sip_client.SipState.IN_CALL
         await client._run_source(FailingSource())
-        return completed
+        return completed, errors
 
-    assert asyncio.run(main()) == []
+    completed, errors = asyncio.run(main())
+    assert completed == []
+    assert errors == ["decoder failed"]
+
+
+def test_public_playback_error_omits_media_urls():
+    if sip_client is None:
+        return
+    ffmpeg = RuntimeError(
+        "ffmpeg exited with status 1: "
+        "https://ha.local/media/local/clip.mp3?authSig=secret"
+    )
+    assert sip_client._public_playback_error(ffmpeg) == "ffmpeg exited with status 1"
+    empty = RuntimeError(
+        "ffmpeg produced no audio: https://ha.local/media/x.wav?authSig=secret"
+    )
+    assert sip_client._public_playback_error(empty) == "ffmpeg produced no audio"
+    other = RuntimeError("download failed https://example/x?authSig=tok")
+    public = sip_client._public_playback_error(other)
+    assert "authSig" not in public
+    assert "https://" not in public.lower()
 
 
 def test_ffmpeg_source_streaming_emits_pcm_before_producer_finishes():
