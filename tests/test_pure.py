@@ -3581,6 +3581,7 @@ def _setup_assist_deps():
     class _PipelineEventType:
         RUN_START = "run-start"
         STT_END = "stt-end"
+        INTENT_PROGRESS = "intent-progress"
         INTENT_END = "intent-end"
         TTS_END = "tts-end"
         ERROR = "error"
@@ -4495,6 +4496,56 @@ def test_assist_tts_starts_before_stream_completes():
 
     played = asyncio.run(run())
     assert played == ["FfmpegAudioSource"]
+
+
+def test_assist_streaming_tts_plays_without_waiting_for_tts_end():
+    """Core can start streamed TTS, then omit TTS_END after empty final speech."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_stream = mock_tts.async_get_stream.return_value
+    played: list[str] = []
+
+    async def stream_audio():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_audio
+    mock_tts.async_get_stream.return_value = stream
+
+    async def run(emit_tts_end):
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda source: played.append(type(source).__name__),
+            on_done_fn=MagicMock(),
+        )
+        bridge._on_pipeline_event(
+            PE(PET.RUN_START, {"tts_output": {"token": "stream-token"}})
+        )
+        bridge._on_pipeline_event(
+            PE(PET.INTENT_PROGRESS, {"tts_start_streaming": True})
+        )
+        if emit_tts_end:
+            bridge._on_pipeline_event(
+                PE(PET.TTS_END, {"tts_output": {"token": "stream-token"}})
+            )
+        for _ in range(50):
+            if played:
+                break
+            await asyncio.sleep(0.01)
+        assert bridge._tts_epoch == 1
+        bridge.close()
+
+    try:
+        for emit_tts_end in (False, True):
+            played.clear()
+            mock_tts.async_get_stream.reset_mock()
+            asyncio.run(run(emit_tts_end))
+            assert played == ["FfmpegAudioSource"]
+            assert mock_tts.async_get_stream.call_count == 1
+            assert mock_tts.async_get_stream.call_args.args[1] == "stream-token"
+    finally:
+        mock_tts.async_get_stream.return_value = original_stream
+        mock_tts.async_get_stream.reset_mock()
 
 
 def test_assist_interrupts_media_only_when_first_tts_audio_is_ready():
