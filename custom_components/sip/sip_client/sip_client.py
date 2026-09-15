@@ -268,6 +268,7 @@ class SipClient:
         self.state = SipState.IDLE
         self.registered = False
         self.last_caller = ""
+        self.last_caller_id_name = ""
         self.last_registered_at: float | None = None
         self.last_register_failed: str | None = None
         self.last_call_reason: str | None = None
@@ -1185,6 +1186,23 @@ class SipClient:
             end = len(frm)
         return frm[lt + 4:end]
 
+    @staticmethod
+    def _extract_caller_id_name(m: sm.SipMessage) -> str:
+        """Return the display-name portion of the SIP From header."""
+        frm = m.header("From").strip()
+        angle = frm.find("<")
+        if angle <= 0:
+            return ""
+        display_name = frm[:angle].strip()
+        if (
+            len(display_name) >= 2
+            and display_name[0] == '"'
+            and display_name[-1] == '"'
+        ):
+            display_name = display_name[1:-1]
+            display_name = re.sub(r"\\(.)", r"\1", display_name)
+        return display_name.strip()
+
     def _build_response(self, req: sm.SipMessage, code: int, reason: str, with_sdp: bool) -> str:
         to = req.header("To")
         if "tag=" not in to:
@@ -1332,6 +1350,7 @@ class SipClient:
                 return
             caller = self._extract_caller(m)
             self.last_caller = caller
+            self.last_caller_id_name = self._extract_caller_id_name(m)
             if self.state != SipState.REGISTERED or self.dnd:
                 if self.dnd:
                     _LOGGER.info("Call rejected due to DND: Busy Here")

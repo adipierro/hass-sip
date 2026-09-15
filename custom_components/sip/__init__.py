@@ -289,6 +289,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "last_registered_at": None,
         "contacts": contacts,
         "call_number": "",
+        "caller_id_name": "",
         "pin_collector": None,
     }
 
@@ -374,6 +375,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         entry.runtime_data["last_caller"] = caller_name
         entry.runtime_data["call_number"] = caller
+        entry.runtime_data["caller_id_name"] = client.last_caller_id_name
 
         # Track call details
         entry.runtime_data["call_start_time"] = time.time()
@@ -389,7 +391,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         async_dispatcher_send(hass, f"{DOMAIN}_state_update_{entry.entry_id}")
         fire_sip_event(
-            EVENT_SIP_INCOMING_CALL, {"caller": caller, "caller_name": caller_name}
+            EVENT_SIP_INCOMING_CALL,
+            {
+                "caller": caller,
+                "caller_name": caller_name,
+                "caller_id_name": client.last_caller_id_name,
+                "contact_name": caller_name,
+                "sip_display_name": client.last_caller_id_name,
+            },
         )
 
     @callback
@@ -449,6 +458,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.runtime_data["call_direction"] = None
             entry.runtime_data["call_status"] = "missed"
             entry.runtime_data["call_number"] = ""
+            entry.runtime_data["caller_id_name"] = ""
 
         fire_sip_event(EVENT_SIP_CALL_ENDED, {"reason": reason})
         nonlocal ivr_session, assist_bridge
