@@ -3581,6 +3581,7 @@ def _setup_assist_deps():
     class _PipelineEventType:
         RUN_START = "run-start"
         STT_END = "stt-end"
+        INTENT_PROGRESS = "intent-progress"
         INTENT_END = "intent-end"
         TTS_END = "tts-end"
         ERROR = "error"
@@ -4495,6 +4496,169 @@ def test_assist_tts_starts_before_stream_completes():
 
     played = asyncio.run(run())
     assert played == ["FfmpegAudioSource"]
+
+
+def test_assist_streaming_tts_plays_without_waiting_for_tts_end():
+    """Core can start streamed TTS, then omit TTS_END after empty final speech."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_stream = mock_tts.async_get_stream.return_value
+    played: list[str] = []
+
+    async def stream_audio():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_audio
+    mock_tts.async_get_stream.return_value = stream
+
+    async def run(emit_tts_end):
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda source: played.append(type(source).__name__),
+            on_done_fn=MagicMock(),
+        )
+        bridge._on_pipeline_event(
+            PE(PET.RUN_START, {"tts_output": {"token": "stream-token"}})
+        )
+        bridge._on_pipeline_event(
+            PE(PET.INTENT_PROGRESS, {"tts_start_streaming": True})
+        )
+        if emit_tts_end:
+            bridge._on_pipeline_event(
+                PE(PET.TTS_END, {"tts_output": {"token": "stream-token"}})
+            )
+        for _ in range(50):
+            if played:
+                break
+            await asyncio.sleep(0.01)
+        assert bridge._tts_epoch == 1
+        # The session must treat the streamed reply as a live TTS turn and
+        # wait for RTP to drain; without TTS_END the old code returned at once
+        # and the next turn tone talked over the reply.
+        assert bridge._speaking is True
+        assert bridge._listening is False
+        waiter = asyncio.ensure_future(bridge._wait_playback_done())
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        bridge.on_playback_done()
+        await asyncio.wait_for(waiter, timeout=2)
+        assert bridge._speaking is False
+        bridge.close()
+
+    try:
+        for emit_tts_end in (False, True):
+            played.clear()
+            mock_tts.async_get_stream.reset_mock()
+            asyncio.run(run(emit_tts_end))
+            assert played == ["FfmpegAudioSource"]
+            assert mock_tts.async_get_stream.call_count == 1
+            assert mock_tts.async_get_stream.call_args.args[1] == "stream-token"
+    finally:
+        mock_tts.async_get_stream.return_value = original_stream
+        mock_tts.async_get_stream.reset_mock()
+
+
+def test_assist_streamed_tts_without_tts_end_blocks_next_turn():
+    """Session loop waits for playback-done after a streamed run with no TTS_END."""
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_stream = mock_tts.async_get_stream.return_value
+
+    async def stream_audio():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_audio
+    mock_tts.async_get_stream.return_value = stream
+
+    async def mock_pipeline(hass, **kwargs):
+        cb = kwargs["event_callback"]
+        cb(PE(PET.RUN_START, {"tts_output": {"token": "stream-token"}}))
+        cb(PE(PET.INTENT_PROGRESS, {"tts_start_streaming": True}))
+        cb(PE(PET.INTENT_END, {"intent_output": {}}))
+        # Empty final speech: Core skips the TTS stage, no TTS_END.
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_turns=1,
+    )
+
+    async def run():
+        bridge.start()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if bridge._tx_wait == "tts":
+                break
+        assert bridge._tx_wait == "tts"
+        assert bridge._speaking is True
+        assert bridge.session_task is not None
+        assert not bridge.session_task.done()
+        bridge.on_playback_done()
+        done, _ = await asyncio.wait({bridge.session_task}, timeout=2)
+        assert done
+
+    try:
+        asyncio.run(run())
+    finally:
+        mock_tts.async_get_stream.return_value = original_stream
+        mock_tts.async_get_stream.reset_mock()
+
+
+def test_assist_error_after_streamed_tts_releases_playback_wait():
+    """An agent error after tts_start_streaming must not stall the session.
+
+    Core never closes the TTS input stream on that path, so the ResultStream
+    never ends; the bridge has to release the playback wait itself.
+    """
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_stream = mock_tts.async_get_stream.return_value
+
+    async def never_ending():
+        await asyncio.Event().wait()
+        yield b""  # pragma: no cover
+
+    stream = MagicMock()
+    stream.async_stream_result = never_ending
+    mock_tts.async_get_stream.return_value = stream
+    stop_audio = MagicMock()
+
+    async def mock_pipeline(hass, **kwargs):
+        cb = kwargs["event_callback"]
+        cb(PE(PET.RUN_START, {"tts_output": {"token": "stream-token"}}))
+        cb(PE(PET.INTENT_PROGRESS, {"tts_start_streaming": True}))
+        await asyncio.sleep(0)
+        cb(PE(PET.ERROR, {"code": "intent-failed", "message": "boom"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        stop_audio_fn=stop_audio,
+        max_turns=1,
+    )
+
+    async def run():
+        bridge.start()
+        # asyncio.wait() does not cancel the task: _run_session swallows
+        # CancelledError, which would let wait_for() return "normally" on
+        # timeout and hide the stall.
+        done, _ = await asyncio.wait({bridge.session_task}, timeout=2)
+        assert done, "session stalled on a TTS stream that never ends"
+
+    try:
+        asyncio.run(run())
+        assert bridge._turn_error == "intent-failed"
+        assert not bridge._background_tasks
+        stop_audio.assert_called_with(flush=True)
+    finally:
+        mock_tts.async_get_stream.return_value = original_stream
+        mock_tts.async_get_stream.reset_mock()
 
 
 def test_assist_interrupts_media_only_when_first_tts_audio_is_ready():
