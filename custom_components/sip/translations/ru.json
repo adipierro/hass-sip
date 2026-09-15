@@ -48,6 +48,11 @@
       "unique_id_mismatch": "Имя пользователя и сервер нельзя изменить здесь. Удалите эту учётную запись и добавьте новую."
     }
   },
+  "exceptions": {
+    "no_active_call": {
+      "message": "Нет активного SIP-вызова для завершения."
+    }
+  },
   "entity": {
     "sensor": {
       "registration_status": {
