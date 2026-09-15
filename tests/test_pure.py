@@ -3580,6 +3580,7 @@ def _setup_assist_deps():
 
     class _PipelineEventType:
         RUN_START = "run-start"
+        INTENT_PROGRESS = "intent-progress"
         STT_END = "stt-end"
         INTENT_PROGRESS = "intent-progress"
         INTENT_END = "intent-end"
@@ -4353,6 +4354,7 @@ def test_start_assist_service_accepts_and_forwards_prompts():
         conversation_id="existing-conversation",
         initial_prompt="Greet the caller",
         system_prompt="Keep answers concise",
+        allow_llm_hangup=False,
         interrupt_media=True,
     )
 
@@ -5465,6 +5467,219 @@ def test_assist_stt_end_event_is_logged_without_error():
     _run_bridge_session(bridge)
     assert turns == [1]
     assert bridge._turn_index == 1
+
+
+def test_assist_hangup_is_deferred_until_turn_completion():
+    """The built-in hang-up request does not call SIP immediately."""
+    assist_mod, _, _, _ = _assist_ctx()
+    hangups: list[str] = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            allow_llm_hangup=True,
+        )
+        assert bridge.request_hangup_after_turn() is True
+        assert hangups == []
+        bridge._complete_deferred_hangup()
+        assert hangups == ["bye"]
+        bridge.close()
+
+    asyncio.run(run())
+
+
+def test_assist_hangup_tool_call_schedules_even_if_core_cannot_dispatch_it():
+    """A SIP pipeline tool-call event still ends the call after the reply."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    hangups: list[str] = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            allow_llm_hangup=True,
+        )
+        bridge._on_pipeline_event(
+            PE(
+                PET.INTENT_PROGRESS,
+                {
+                    "chat_log_delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "tool_name": "sip__hang_up_current_call",
+                                "tool_args": {},
+                                "external": False,
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+        bridge._on_pipeline_event(
+            PE(
+                PET.INTENT_PROGRESS,
+                {"chat_log_delta": {"role": "tool_result", "tool_result": {
+                    "error": "HomeAssistantError",
+                    "error_text": 'Tool "sip__hang_up_current_call" not found',
+                }}},
+            )
+        )
+        assert bridge._hangup_requested is True
+        assert hangups == []
+        bridge._speaking = True
+        bridge._tx_wait = "tts"
+        bridge.on_playback_done()
+        await bridge._wait_playback_done()
+        bridge._complete_deferred_hangup()
+        assert hangups == ["bye"]
+        bridge.close()
+
+    asyncio.run(run())
+
+
+def test_assist_hangup_tool_input_object_schedules_without_crashing_intent():
+    """Live Core intent progress contains ToolInput objects, unlike the trace."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    hangups: list[str] = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            allow_llm_hangup=True,
+        )
+        bridge._on_pipeline_event(
+            PE(
+                PET.INTENT_PROGRESS,
+                {
+                    "chat_log_delta": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            types.SimpleNamespace(
+                                tool_name="assist__sip__hang_up_current_call",
+                                tool_args={},
+                                external=False,
+                            )
+                        ],
+                    }
+                },
+            )
+        )
+        assert bridge._hangup_requested is True
+        bridge._complete_deferred_hangup()
+        assert hangups == ["bye"]
+        bridge.close()
+
+    asyncio.run(run())
+
+
+def test_assist_hangup_tool_call_ignored_without_opt_in():
+    """A guessed tool name cannot end a SIP call unless the service opted in."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    hangups: list[str] = []
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        hangup_fn=lambda: hangups.append("bye"),
+    )
+    bridge._on_pipeline_event(
+        PE(
+            PET.INTENT_PROGRESS,
+            {
+                "chat_log_delta": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_name": "sip__hang_up_current_call",
+                            "tool_args": {},
+                            "external": False,
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    bridge._complete_deferred_hangup()
+    assert hangups == []
+    bridge.close()
+
+
+def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
+    monkeypatch,
+):
+    """An opted-in SIP Assist request gets a callable LLM API tool."""
+    assist_mod, _, _, _ = _assist_ctx()
+    llm_component = types.ModuleType("homeassistant.components.llm")
+    llm_component.LLMTools = lambda *, tools, prompt=None: types.SimpleNamespace(
+        tools=tools, prompt=prompt
+    )
+    llm_helpers = types.ModuleType("homeassistant.helpers.llm")
+    llm_helpers.LLM_API_ASSIST = "assist"
+    llm_helpers.LLMContext = type("LLMContext", (), {})
+    llm_helpers.Tool = type("Tool", (), {})
+    llm_helpers.ToolInput = type("ToolInput", (), {})
+    llm_json = types.ModuleType("homeassistant.util.json")
+    llm_json.JsonObjectType = dict
+    monkeypatch.setitem(sys.modules, "homeassistant.components.llm", llm_component)
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.llm", llm_helpers)
+    monkeypatch.setitem(sys.modules, "homeassistant.util.json", llm_json)
+
+    module_name = f"{_CC_PKG}._llm_platform_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, os.path.join(os.path.abspath(_COMPONENT), "llm.py")
+    )
+    platform = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, platform)
+    spec.loader.exec_module(platform)
+
+    hangups: list[str] = []
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        user_id="sip-user",
+        device_id="sip-device",
+        hangup_fn=lambda: hangups.append("bye"),
+        allow_llm_hangup=True,
+    )
+    bridge._context.user_id = "sip-user"
+    client = MagicMock()
+    client.state = platform.SipState.IN_CALL
+    data = {"get_assist": lambda: bridge, "client": client}
+    entry = types.SimpleNamespace(runtime_data=data)
+    hass = MagicMock()
+    hass.config_entries.async_entries.return_value = [entry]
+    context = types.SimpleNamespace(
+        device_id="sip-device", context=types.SimpleNamespace(user_id="sip-user")
+    )
+    direct_tool = platform.SipHangUpCurrentCallTool(data, bridge, client)
+    assert bridge._context.user_id == "sip-user"
+    assert direct_tool._is_current_call(context)
+    tools = platform.async_get_tools(hass, context, "assist")
+    assert [tool.name for tool in tools.tools] == ["sip__hang_up_current_call"]
+    assert "assist__sip__hang_up_current_call" in tools.prompt
+    assert "sip__hang_up_current_call" in tools.prompt
+
+    async def run():
+        result = await tools.tools[0].async_call(
+            hass, types.SimpleNamespace(tool_args={}), context
+        )
+        assert result == {"success": True, "result": {"status": "scheduled_after_turn"}}
+        assert hangups == []
+        bridge._complete_deferred_hangup()
+        assert hangups == ["bye"]
+        bridge.close()
+
+    asyncio.run(run())
 
 
 def test_assist_turn_tone_playback_done_does_not_set_tts_event():

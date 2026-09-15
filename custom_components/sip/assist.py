@@ -29,7 +29,11 @@ from homeassistant.components.stt import (
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers import chat_session
 
-from .const import LOGGER
+from .const import (
+    ASSIST_HANGUP_MERGED_TOOL_NAME,
+    ASSIST_HANGUP_TOOL_NAME,
+    LOGGER,
+)
 from .helpers import get_ffmpeg_bin
 from .sip_client.audio import AudioSink, AudioSource, FfmpegAudioSource, ToneAudioSource
 
@@ -57,6 +61,7 @@ _TONE_WAIT_TIMEOUT_SECONDS = 3
 # minute; this is a safety net for a lost on_playback_done signal, not a
 # normal-case ceiling, so it stays generous.
 _TTS_WAIT_TIMEOUT_SECONDS = 300
+_DEFERRED_HANGUP_TIMEOUT_SECONDS = 30
 _TxWaitKind = Literal["tts", "tone"]
 
 
@@ -211,6 +216,8 @@ class AssistBridge(AudioSink):
         interrupt_media: bool = True,
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
+        hangup_fn: Callable[[], None] | None = None,
+        allow_llm_hangup: bool = False,
         user_id: str | None = None,
         device_id: str | None = None,
     ) -> None:
@@ -236,6 +243,8 @@ class AssistBridge(AudioSink):
         self._interrupt_media_pending = interrupt_media
         self.stop_audio_fn = stop_audio_fn
         self.media_playing_fn = media_playing_fn
+        self.hangup_fn = hangup_fn
+        self.allow_llm_hangup = allow_llm_hangup
         self._context = Context(user_id=user_id)
         self._device_id = device_id
 
@@ -250,6 +259,8 @@ class AssistBridge(AudioSink):
         self._running = True
         self._listening = False
         self._speaking = False
+        self._hangup_requested = False
+        self._hangup_timeout: asyncio.TimerHandle | None = None
         self._tx_done = asyncio.Event()
         self._tx_wait: _TxWaitKind | None = None
         self._turn_error: str | None = None
@@ -314,6 +325,10 @@ class AssistBridge(AudioSink):
 
     def close(self) -> None:
         """Stop the bridge and cancel running tasks."""
+        self._hangup_requested = False
+        if self._hangup_timeout is not None:
+            self._hangup_timeout.cancel()
+            self._hangup_timeout = None
         self._running = False
         self._listening = False
         self._speaking = False
@@ -329,6 +344,57 @@ class AssistBridge(AudioSink):
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
+
+    def _observe_hangup_tool_calls(self, data: dict) -> None:
+        """Schedule Hang Up from live SIP intent progress, even if Core rejects it."""
+        delta = data.get("chat_log_delta") or {}
+        for tool_call in delta.get("tool_calls") or []:
+            if isinstance(tool_call, dict):
+                tool_name = tool_call.get("tool_name")
+                tool_args = tool_call.get("tool_args")
+                external = tool_call.get("external", False)
+            else:
+                # Core emits ToolInput objects here; traces serialize those
+                # same calls as dictionaries.
+                tool_name = getattr(tool_call, "tool_name", None)
+                tool_args = getattr(tool_call, "tool_args", None)
+                external = getattr(tool_call, "external", True)
+            if (
+                tool_name in (
+                    ASSIST_HANGUP_TOOL_NAME,
+                    ASSIST_HANGUP_MERGED_TOOL_NAME,
+                )
+                and tool_args == {}
+                and not external
+            ):
+                # The Assist API may omit a per-call tool from the current
+                # dispatch list even though the agent emitted its call.
+                self.request_hangup_after_turn()
+
+    def request_hangup_after_turn(self) -> bool:
+        """Queue a SIP hang-up after this intent turn and its TTS finish."""
+        if not self.allow_llm_hangup or not self._running or self.hangup_fn is None:
+            return False
+        if self._hangup_requested:
+            return True
+        self._hangup_requested = True
+        self._hangup_timeout = asyncio.get_running_loop().call_later(
+            _DEFERRED_HANGUP_TIMEOUT_SECONDS, self._complete_deferred_hangup
+        )
+        LOGGER.info("Assist Hang Up tool scheduled after current turn")
+        return True
+
+    def _complete_deferred_hangup(self) -> None:
+        """End the current call after TTS, or after the bounded wait expires."""
+        if not self._hangup_requested or not self._running:
+            return
+        self._hangup_requested = False
+        if self._hangup_timeout is not None:
+            self._hangup_timeout.cancel()
+            self._hangup_timeout = None
+        LOGGER.info("Assist Hang Up tool ending call after turn")
+        if self.hangup_fn is not None:
+            self.hangup_fn()
 
     def _append_rx_to_ring(self, pcm_16k: bytes) -> None:
         self._ring_buffer.extend(pcm_16k)
@@ -502,6 +568,7 @@ class AssistBridge(AudioSink):
                 self._turn_index = 0
                 await self._run_initial_prompt(pipeline)
                 await self._wait_playback_done()
+                self._complete_deferred_hangup()
                 if not self._running:
                     return
 
@@ -572,6 +639,7 @@ class AssistBridge(AudioSink):
                 )
 
                 await self._wait_playback_done()
+                self._complete_deferred_hangup()
 
                 if not self._running:
                     break
@@ -703,6 +771,9 @@ class AssistBridge(AudioSink):
             return
 
         LOGGER.debug("Assist pipeline event: %s", event.type)
+
+        if event.type == PipelineEventType.INTENT_PROGRESS and event.data:
+            self._observe_hangup_tool_calls(event.data)
 
         if event.type == PipelineEventType.RUN_START:
             self._run_tts_token = None
