@@ -2834,6 +2834,54 @@ def test_rtp_flush_tx_buffer():
     asyncio.run(run())
 
 
+def test_replaced_audio_source_is_retained_until_cancel_cleanup_finishes():
+    if sip_client is None:
+        return
+
+    class CleanupSource(audio.AudioSource):
+        def __init__(self, cleanup_started, cleanup_finished):
+            self.cleanup_started = cleanup_started
+            self.cleanup_finished = cleanup_finished
+
+        async def run(self, push, is_active):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleanup_started.set()
+                await self.cleanup_finished.wait()
+
+    class WaitingSource(audio.AudioSource):
+        async def run(self, push, is_active):
+            await asyncio.Event().wait()
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.IN_CALL
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        client.play_source(CleanupSource(cleanup_started, cleanup_finished))
+        old_task = client._tx_source_task
+        await asyncio.sleep(0)
+
+        client.play_source(WaitingSource())
+        await cleanup_started.wait()
+        assert old_task in client._tx_source_tasks
+        assert not old_task.done()
+
+        cleanup_finished.set()
+        try:
+            await old_task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        assert old_task not in client._tx_source_tasks
+
+        client.stop_audio(flush=True)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
 def test_rtp_hold_resume_catches_up_timestamp():
     async def run():
         session = rtp_session.RtpSession()
