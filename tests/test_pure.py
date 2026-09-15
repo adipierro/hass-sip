@@ -2845,18 +2845,30 @@ def test_replacing_audio_source_flushes_old_pcm():
     async def run():
         client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
         client.state = sip_client.SipState.IN_CALL
+        # push_tx_audio() is a no-op without a transport; give it one so the
+        # buffer really fills and the flush is what empties it.
+        client.rtp._transport = object()
+
+        # No live source: leftover PCM is kept (not a replacement).
         client.rtp.push_tx_audio(b"old audio")
         client.play_source(WaitingSource())
+        kept = bytes(client.rtp._tx_buffer)
         await asyncio.sleep(0)
-        client.rtp.push_tx_audio(b"queued tail")
 
+        # Live source: its queued prebuffer must go when it is replaced.
+        client.rtp.push_tx_audio(b"queued tail")
+        before = bytes(client.rtp._tx_buffer)
         client.play_source(WaitingSource())
-        flushed = bytes(client.rtp._tx_buffer)
+        after = bytes(client.rtp._tx_buffer)
+
         client.stop_audio(flush=True)
         await asyncio.sleep(0)
-        return flushed
+        return kept, before, after
 
-    assert asyncio.run(run()) == b""
+    kept, before, after = asyncio.run(run())
+    assert kept == b"old audio"
+    assert before == b"old audioqueued tail"
+    assert after == b""
 
 
 def test_rtp_hold_resume_catches_up_timestamp():
