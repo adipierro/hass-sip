@@ -253,7 +253,7 @@ def test_start_assist_rejects_unknown_caller():
             integration, caller="sip:200@pbx"
         )
         data = integration.SERVICE_ASSIST_SCHEMA({"allowed_callers": ["100"]})
-        await handler(types.SimpleNamespace(data=data))
+        await handler(_service_call(data))
         return hass, trigger
 
     hass, trigger = asyncio.run(run())
@@ -273,12 +273,33 @@ def test_start_assist_allows_listed_caller():
             integration, caller="sip:100@pbx"
         )
         data = integration.SERVICE_ASSIST_SCHEMA({"allowed_callers": ["100"]})
-        await handler(types.SimpleNamespace(data=data))
+        await handler(_service_call(data))
         return hass, trigger
 
     hass, trigger = asyncio.run(run())
     trigger.assert_awaited_once()
     assert _rejected_events(hass) == []
+
+
+# ---------------------------------------------- service target / permissions
+def _service_call(data, *, user_id=None):
+    """Shape a ServiceCall like HA does: ``context`` is always present."""
+    return types.SimpleNamespace(
+        data=data, context=types.SimpleNamespace(user_id=user_id)
+    )
+
+
+def _phone_line_entity():
+    return types.SimpleNamespace(
+        entity_id="media_player.phone_line", domain="media_player", platform="sip"
+    )
+
+
+def _user(*, control: bool, is_admin: bool = False):
+    user = MagicMock()
+    user.is_admin = is_admin
+    user.permissions.check_entity.return_value = control
+    return user
 
 
 def test_explicit_unmatched_target_does_not_fall_back_to_first_account():
@@ -289,110 +310,160 @@ def test_explicit_unmatched_target_does_not_fall_back_to_first_account():
             integration, caller="100"
         )
         integration.async_extract_config_entry_ids = AsyncMock(return_value=set())
-        await handler(
-            types.SimpleNamespace(
-                data={"entity_id": ["media_player.missing_phone_line"]}
+        try:
+            await handler(
+                _service_call({"entity_id": ["media_player.missing_phone_line"]})
             )
-        )
-        return trigger
+        except integration.ServiceValidationError:
+            return trigger
+        raise AssertionError("expected ServiceValidationError")
 
     asyncio.run(run()).assert_not_awaited()
+
+
+def test_untargeted_call_falls_back_to_first_account():
+    integration = _load_sip_init()
+
+    async def run():
+        _hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        integration.async_extract_config_entry_ids = AsyncMock(return_value=set())
+        await handler(_service_call({}))
+        return trigger
+
+    asyncio.run(run()).assert_awaited_once()
 
 
 def test_service_user_must_control_target_phone_line():
     integration = _load_sip_init()
 
-    class Unauthorized(Exception):
-        def __init__(self, **_kwargs):
-            super().__init__("unauthorized")
-
-    class UnknownUser(Exception):
-        pass
-
-    auth_const = types.ModuleType("homeassistant.auth.permissions.const")
-    auth_const.POLICY_CONTROL = "control"
-    exceptions = types.ModuleType("homeassistant.exceptions")
-    exceptions.Unauthorized = Unauthorized
-    exceptions.UnknownUser = UnknownUser
-    old_auth_const = sys.modules.get("homeassistant.auth.permissions.const")
-    old_exceptions = sys.modules.get("homeassistant.exceptions")
-    sys.modules["homeassistant.auth.permissions.const"] = auth_const
-    sys.modules["homeassistant.exceptions"] = exceptions
-
     async def run():
-        hass, _trigger, _entry, handler = await _register_start_assist(
+        hass, trigger, _entry, handler = await _register_start_assist(
             integration, caller="100"
         )
-        user = MagicMock()
-        user.permissions.check_entity.return_value = False
-        hass.auth.async_get_user = AsyncMock(return_value=user)
+        hass.auth.async_get_user = AsyncMock(return_value=_user(control=False))
         integration.er.async_entries_for_config_entry.return_value = [
-            types.SimpleNamespace(
-                entity_id="media_player.phone_line",
-                domain="media_player",
-                platform="sip",
-            )
+            _phone_line_entity()
         ]
-        call = types.SimpleNamespace(
-            data={"entity_id": ["media_player.phone_line"]},
-            context=types.SimpleNamespace(user_id="ordinary-user"),
-        )
         try:
-            await handler(call)
-        except Unauthorized:
-            return
+            await handler(
+                _service_call(
+                    {"entity_id": ["media_player.phone_line"]}, user_id="ordinary"
+                )
+            )
+        except integration.Unauthorized as err:
+            assert err.permission == "control"
+            return trigger
         raise AssertionError("expected unauthorized service call")
 
-    try:
-        asyncio.run(run())
-    finally:
-        if old_auth_const is None:
-            sys.modules.pop("homeassistant.auth.permissions.const", None)
-        else:
-            sys.modules["homeassistant.auth.permissions.const"] = old_auth_const
-        if old_exceptions is None:
-            sys.modules.pop("homeassistant.exceptions", None)
-        else:
-            sys.modules["homeassistant.exceptions"] = old_exceptions
+    asyncio.run(run()).assert_not_awaited()
 
 
-def test_authorized_service_user_can_control_target_phone_line():
+def test_untargeted_fallback_still_checks_user_permission():
     integration = _load_sip_init()
-
-    auth_const = types.ModuleType("homeassistant.auth.permissions.const")
-    auth_const.POLICY_CONTROL = "control"
-    old_auth_const = sys.modules.get("homeassistant.auth.permissions.const")
-    sys.modules["homeassistant.auth.permissions.const"] = auth_const
 
     async def run():
         hass, trigger, _entry, handler = await _register_start_assist(
             integration, caller="100"
         )
-        user = MagicMock()
-        user.permissions.check_entity.return_value = True
-        hass.auth.async_get_user = AsyncMock(return_value=user)
+        integration.async_extract_config_entry_ids = AsyncMock(return_value=set())
+        hass.auth.async_get_user = AsyncMock(return_value=_user(control=False))
         integration.er.async_entries_for_config_entry.return_value = [
-            types.SimpleNamespace(
-                entity_id="media_player.phone_line",
-                domain="media_player",
-                platform="sip",
-            )
+            _phone_line_entity()
+        ]
+        try:
+            await handler(_service_call({}, user_id="ordinary"))
+        except integration.Unauthorized:
+            return trigger
+        raise AssertionError("expected unauthorized service call")
+
+    asyncio.run(run()).assert_not_awaited()
+
+
+def test_authorized_service_user_can_control_target_phone_line():
+    integration = _load_sip_init()
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        hass.auth.async_get_user = AsyncMock(return_value=_user(control=True))
+        integration.er.async_entries_for_config_entry.return_value = [
+            _phone_line_entity()
         ]
         await handler(
-            types.SimpleNamespace(
-                data={"entity_id": ["media_player.phone_line"]},
-                context=types.SimpleNamespace(user_id="ordinary-user"),
+            _service_call(
+                {"entity_id": ["media_player.phone_line"]}, user_id="ordinary"
             )
         )
         return trigger
 
-    try:
-        asyncio.run(run()).assert_awaited_once()
-    finally:
-        if old_auth_const is None:
-            sys.modules.pop("homeassistant.auth.permissions.const", None)
-        else:
-            sys.modules["homeassistant.auth.permissions.const"] = old_auth_const
+    asyncio.run(run()).assert_awaited_once()
+
+
+def test_admin_is_not_locked_out_when_phone_line_entity_missing():
+    integration = _load_sip_init()
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        hass.auth.async_get_user = AsyncMock(
+            return_value=_user(control=False, is_admin=True)
+        )
+        integration.er.async_entries_for_config_entry.return_value = []
+        await handler(
+            _service_call(
+                {"entity_id": ["media_player.phone_line"]}, user_id="admin"
+            )
+        )
+        return trigger
+
+    asyncio.run(run()).assert_awaited_once()
+
+
+def test_restricted_user_denied_when_phone_line_entity_missing():
+    integration = _load_sip_init()
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        hass.auth.async_get_user = AsyncMock(return_value=_user(control=True))
+        integration.er.async_entries_for_config_entry.return_value = []
+        try:
+            await handler(
+                _service_call(
+                    {"entity_id": ["media_player.phone_line"]}, user_id="ordinary"
+                )
+            )
+        except integration.Unauthorized:
+            return trigger
+        raise AssertionError("expected fail-closed for restricted user")
+
+    asyncio.run(run()).assert_not_awaited()
+
+
+def test_unknown_service_user_is_rejected():
+    integration = _load_sip_init()
+
+    async def run():
+        hass, trigger, _entry, handler = await _register_start_assist(
+            integration, caller="100"
+        )
+        hass.auth.async_get_user = AsyncMock(return_value=None)
+        try:
+            await handler(
+                _service_call(
+                    {"entity_id": ["media_player.phone_line"]}, user_id="ghost"
+                )
+            )
+        except integration.UnknownUser:
+            return trigger
+        raise AssertionError("expected UnknownUser")
+
+    asyncio.run(run()).assert_not_awaited()
 
 
 def test_start_assist_pin_mismatch_does_not_start():
@@ -403,7 +474,7 @@ def test_start_assist_pin_mismatch_does_not_start():
             integration, caller="100"
         )
         data = integration.SERVICE_ASSIST_SCHEMA({"pin": "1234"})
-        task = asyncio.create_task(handler(types.SimpleNamespace(data=data)))
+        task = asyncio.create_task(handler(_service_call(data)))
         collector = None
         for _ in range(50):
             collector = entry.runtime_data.get("pin_collector")
@@ -433,7 +504,7 @@ def test_start_assist_pin_ok_starts_assist():
             integration, caller="100"
         )
         data = integration.SERVICE_ASSIST_SCHEMA({"pin": "1234"})
-        task = asyncio.create_task(handler(types.SimpleNamespace(data=data)))
+        task = asyncio.create_task(handler(_service_call(data)))
         collector = None
         for _ in range(50):
             collector = entry.runtime_data.get("pin_collector")

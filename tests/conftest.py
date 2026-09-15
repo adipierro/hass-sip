@@ -73,6 +73,47 @@ for mod in [
 ]:
     sys.modules[mod] = MagicMock()
 
+# homeassistant.exceptions / auth constants: real exception classes so
+# integration code can raise/catch them and tests can assert on them.
+class HomeAssistantError(Exception):
+    pass
+
+
+class ServiceValidationError(HomeAssistantError):
+    pass
+
+
+class Unauthorized(HomeAssistantError):
+    def __init__(self, context=None, user_id=None, entity_id=None,
+                 config_entry_id=None, perm_category=None, permission=None):
+        super().__init__(self.__class__.__name__)
+        self.context = context
+        self.user_id = user_id
+        self.entity_id = entity_id
+        self.config_entry_id = config_entry_id
+        self.perm_category = perm_category
+        self.permission = permission
+
+
+class UnknownUser(Unauthorized):
+    pass
+
+
+_exceptions_mod = types.ModuleType("homeassistant.exceptions")
+_exceptions_mod.HomeAssistantError = HomeAssistantError
+_exceptions_mod.ServiceValidationError = ServiceValidationError
+_exceptions_mod.Unauthorized = Unauthorized
+_exceptions_mod.UnknownUser = UnknownUser
+sys.modules["homeassistant.exceptions"] = _exceptions_mod
+
+sys.modules["homeassistant.auth"] = MagicMock()
+sys.modules["homeassistant.auth.permissions"] = MagicMock()
+_auth_const_mod = types.ModuleType("homeassistant.auth.permissions.const")
+_auth_const_mod.CAT_ENTITIES = "entities"
+_auth_const_mod.POLICY_CONTROL = "control"
+_auth_const_mod.POLICY_READ = "read"
+sys.modules["homeassistant.auth.permissions.const"] = _auth_const_mod
+
 sys.modules["homeassistant.helpers.restore_state"].RestoreEntity = MockRestoreEntity
 sys.modules["homeassistant.components.switch"].SwitchEntity = MockBase
 

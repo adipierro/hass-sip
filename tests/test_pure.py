@@ -3790,7 +3790,10 @@ def test_start_assist_service_accepts_and_forwards_prompts():
             if call.args[:2] == ("sip", "start_assist")
         )
         handler = registration.args[2]
-        await handler(types.SimpleNamespace(data=service_data))
+        call = types.SimpleNamespace(
+            data=service_data, context=types.SimpleNamespace(user_id=None)
+        )
+        await handler(call)
 
     asyncio.run(run_service())
     trigger_assist.assert_awaited_once_with(

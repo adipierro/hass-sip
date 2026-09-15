@@ -9,9 +9,15 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.auth.permissions.const import CAT_ENTITIES, POLICY_CONTROL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import (
+    ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -714,8 +720,11 @@ async def async_register_services(hass: HomeAssistant) -> None:
             for key in ("entity_id", "device_id", "area_id", "floor_id", "label_id")
         )
         if not matched_entries and has_explicit_target:
-            LOGGER.warning("SIP service target did not match a loaded SIP account")
-            return []
+            # Never fall back to another account for a target the caller
+            # named; surface it so automations/Developer Tools see a failure.
+            raise ServiceValidationError(
+                "SIP service target did not match a loaded SIP account"
+            )
 
         if not matched_entries:
             # Fallback to the first loaded entry
@@ -731,16 +740,18 @@ async def async_register_services(hass: HomeAssistant) -> None:
                     (loaded_entries[0].entry_id, loaded_entries[0].runtime_data)
                 )
 
-        context = getattr(call, "context", None)
-        user_id = getattr(context, "user_id", None)
+        # These are domain services, not entity-platform services, so HA does
+        # not enforce entity permissions for us. Mirror entity_service_call:
+        # a user-initiated call must be allowed to control the account's
+        # phone-line media_player. Calls without a user (automations, system)
+        # are not checked.
+        user_id = call.context.user_id
         if user_id:
-            from homeassistant.auth.permissions.const import POLICY_CONTROL
-
             user = await hass.auth.async_get_user(user_id)
             if user is None:
-                from homeassistant.exceptions import UnknownUser
-
-                raise UnknownUser(context=context, user_id=user_id)
+                raise UnknownUser(
+                    context=call.context, permission=POLICY_CONTROL, user_id=user_id
+                )
 
             registry = er.async_get(hass)
             for entry_id, _data in matched_entries:
@@ -751,16 +762,18 @@ async def async_register_services(hass: HomeAssistant) -> None:
                     )
                     if entity.domain == "media_player" and entity.platform == DOMAIN
                 ]
-                if not any(
+                # Admins pass even when no phone-line entity is registered
+                # (any([]) would otherwise lock them out); restricted users
+                # stay fail-closed.
+                if not user.is_admin and not any(
                     user.permissions.check_entity(entity_id, POLICY_CONTROL)
                     for entity_id in entity_ids
                 ):
-                    from homeassistant.exceptions import Unauthorized
-
                     raise Unauthorized(
-                        context=context,
+                        context=call.context,
                         permission=POLICY_CONTROL,
                         user_id=user_id,
+                        perm_category=CAT_ENTITIES,
                     )
 
         return matched_entries
