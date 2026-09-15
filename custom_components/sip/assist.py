@@ -671,6 +671,7 @@ class AssistBridge(AudioSink):
 
     async def _wait_playback_done(self) -> None:
         """Wait for TTS playback to finish before starting the next turn."""
+        self._playing_tts_token = None
         if not self._speaking:
             return
         try:
@@ -688,7 +689,6 @@ class AssistBridge(AudioSink):
         self._tx_done.clear()
         self._tx_wait = None
         self._speaking = False
-        self._playing_tts_token = None
         if not ended_by_barge_in:
             # Drop barge-in residue, then settle so speakerphone echo of the
             # response is less likely to look like the next command. write()
@@ -705,6 +705,7 @@ class AssistBridge(AudioSink):
         LOGGER.debug("Assist pipeline event: %s", event.type)
 
         if event.type == PipelineEventType.RUN_START:
+            self._run_tts_token = None
             if event.data:
                 self._conversation_id = event.data.get("conversation_id")
                 self._run_tts_token = (event.data.get("tts_output") or {}).get("token")
@@ -739,6 +740,7 @@ class AssistBridge(AudioSink):
             if event.data:
                 self._turn_error = event.data.get("code")
             LOGGER.error("Assist pipeline error: %s", event.data)
+            self._abort_streamed_tts()
 
     def _begin_tts_playback(self, token: str | None) -> None:
         """Start RTP when Core starts streaming, or at TTS_END for regular TTS."""
@@ -746,6 +748,11 @@ class AssistBridge(AudioSink):
             return
         stream = tts.async_get_stream(self.hass, token)
         if stream is None:
+            LOGGER.warning(
+                "Assist turn %d: TTS stream %s not found; no reply will be played",
+                self._turn_index,
+                token,
+            )
             return
         self._playing_tts_token = token
         self._listening = False  # STT has ended; RX now belongs to the TTS turn.
@@ -757,6 +764,19 @@ class AssistBridge(AudioSink):
         task = asyncio.create_task(self._play_tts_stream(stream, epoch))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _abort_streamed_tts(self) -> None:
+        """Release the playback wait when a run fails after TTS streaming began.
+
+        When the conversation agent raises after ``tts_start_streaming``, Core
+        never closes the TTS input stream and emits no TTS_END, so the
+        ResultStream never ends. Without this the session would sit in
+        ``_wait_playback_done()`` until its timeout instead of moving on.
+        """
+        if self._playing_tts_token is None or not self._speaking:
+            return
+        self._cancel_inflight_tts(stop_audio=True)
+        self._tx_done.set()
 
     async def _play_tts_stream(self, stream: tts.ResultStream, epoch: int) -> None:
         """Play TTS into RTP as soon as the first audio chunk arrives.
