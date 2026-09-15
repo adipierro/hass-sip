@@ -5060,13 +5060,28 @@ def test_sip_device_id_lookup():
         assert init_mod._sip_device_id(hass, "entry_abc") is None
 
 
-def test_contact_refresh_replaces_cache_with_executor_result():
+def _load_init_for_contacts():
+    _assist_ctx()  # __init__ imports assist/*; make the stubs order-independent
     if "homeassistant.helpers.service" not in sys.modules:
         service_stub = types.ModuleType("homeassistant.helpers.service")
         service_stub.async_extract_config_entry_ids = MagicMock()
         sys.modules["homeassistant.helpers.service"] = service_stub
+    return _load_component_module("__init__")
 
-    init_mod = _load_component_module("__init__")
+
+def _contacts_hass(tmp_dir):
+    hass = MagicMock()
+    hass.config.path.return_value = tmp_dir
+
+    async def executor(func, *args):
+        return func(*args)
+
+    hass.async_add_executor_job = executor
+    return hass
+
+
+def test_contact_refresh_replaces_cache_with_executor_result():
+    init_mod = _load_init_for_contacts()
 
     async def run():
         hass = MagicMock()
@@ -5084,6 +5099,51 @@ def test_contact_refresh_replaces_cache_with_executor_result():
     assert asyncio.run(run()) == {
         "200": {"name": "Front door", "auto_answer": True}
     }
+
+
+def test_contact_refresh_keeps_cache_while_file_is_unparseable():
+    """A half-written / invalid sip_contacts.json must not wipe auto-answer."""
+    init_mod = _load_init_for_contacts()
+    good = {"200": {"name": "Front door", "auto_answer": True}}
+
+    async def run(tmp_dir):
+        hass = _contacts_hass(tmp_dir)
+        path = os.path.join(tmp_dir, "sip_contacts.json")
+        runtime = {"contacts": dict(good)}
+        with patch.object(init_mod.LOGGER, "warning") as warn:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"200": {"name": "Fr')  # editor mid-save
+            await init_mod.async_refresh_contacts(hass, runtime)
+            await init_mod.async_refresh_contacts(hass, runtime)
+            kept = runtime["contacts"]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("[1, 2]")  # valid JSON, not an object
+            await init_mod.async_refresh_contacts(hass, runtime)
+            kept_list = runtime["contacts"]
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"201": "Gate"}')
+            await init_mod.async_refresh_contacts(hass, runtime)
+            return kept, kept_list, runtime["contacts"], warn.call_count
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        kept, kept_list, after, warnings = asyncio.run(run(tmp_dir))
+    assert kept == good
+    assert kept_list == good
+    assert after == {"201": "Gate"}
+    assert warnings == 1  # once per outage, not once per tick
+
+
+def test_contact_refresh_empties_cache_when_file_removed():
+    init_mod = _load_init_for_contacts()
+
+    async def run(tmp_dir):
+        hass = _contacts_hass(tmp_dir)
+        runtime = {"contacts": {"200": "Front door"}}
+        await init_mod.async_refresh_contacts(hass, runtime)
+        return runtime["contacts"]
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        assert asyncio.run(run(tmp_dir)) == {}
 
 
 if __name__ == "__main__":
