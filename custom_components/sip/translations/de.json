@@ -48,6 +48,11 @@
       "unique_id_mismatch": "Benutzername und Server können hier nicht geändert werden. Bitte entferne dieses Konto und füge stattdessen ein neues hinzu."
     }
   },
+  "exceptions": {
+    "no_active_call": {
+      "message": "Kein aktiver SIP-Anruf zum Auflegen."
+    }
+  },
   "entity": {
     "sensor": {
       "registration_status": {

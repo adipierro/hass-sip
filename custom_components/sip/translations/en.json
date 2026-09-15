@@ -48,6 +48,11 @@
       "unique_id_mismatch": "The username and server can't be changed here. Remove this account and add a new one instead."
     }
   },
+  "exceptions": {
+    "no_active_call": {
+      "message": "No active SIP call to hang up."
+    }
+  },
   "entity": {
     "sensor": {
       "registration_status": {

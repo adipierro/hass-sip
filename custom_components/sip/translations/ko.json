@@ -48,6 +48,11 @@
       "unique_id_mismatch": "이곳에서는 사용자명과 서버를 변경할 수 없습니다. 이 계정을 삭제하고 새로 추가해 주세요."
     }
   },
+  "exceptions": {
+    "no_active_call": {
+      "message": "종료할 활성 SIP 통화가 없습니다."
+    }
+  },
   "entity": {
     "sensor": {
       "registration_status": {
