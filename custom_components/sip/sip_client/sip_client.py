@@ -1240,17 +1240,28 @@ class SipClient:
         self._send_raw(self._build_response(m, 200, "OK", False))
 
     def _is_current_dialog_request(self, m: sm.SipMessage) -> bool:
-        """Return whether an in-dialog request belongs to the active call."""
+        """Return whether an in-dialog request belongs to our current dialog.
+
+        Early dialogs count: _d_call_id is set when the INVITE is received
+        (INCOMING) or sent (INVITING), and a caller may BYE a ringing call.
+        Replying 481 to a request that *is* in our dialog would make the
+        remote tear the dialog down (RFC 3261 §12.2.1.2).
+        """
         return bool(
             self._d_call_id
             and m.header("Call-ID") == self._d_call_id
-            and self.state in (SipState.IN_CALL, SipState.ANSWERING)
+            and self.state in _DIALOG_STATES
         )
 
     def _cancel_matches_invite(self, m: sm.SipMessage) -> bool:
-        """Return whether CANCEL matches the pending initial INVITE transaction."""
+        """Return whether CANCEL matches the pending initial INVITE transaction.
+
+        The INVITE server transaction lives until the ACK, so this also
+        matches in ANSWERING (200 sent); the caller decides whether a match
+        still cancels anything.
+        """
         invite = self._incoming_invite
-        if self.state != SipState.INCOMING or invite is None:
+        if self.state not in (SipState.INCOMING, SipState.ANSWERING) or invite is None:
             return False
         cancel_cseq = _cseq_number(m.header("CSeq"))
         invite_cseq = _cseq_number(invite.header("CSeq"))
@@ -1373,6 +1384,11 @@ class SipClient:
                 )
                 return
             self._send_raw(self._build_response(m, 200, "OK", False))
+            if self.state != SipState.INCOMING:
+                # Already answered (200 OK sent, awaiting ACK): the CANCEL
+                # matches the transaction but arrived too late to act on.
+                _LOGGER.debug("CANCEL after 200 OK ignored")
+                return
             assert self._incoming_invite is not None
             self._send_raw(
                 self._build_response(
@@ -1395,6 +1411,11 @@ class SipClient:
             self._send_raw(self._build_response(m, 200, "OK", False))
             digit = _parse_info_dtmf(m.header("Content-Type"), m.body)
             if digit is None:
+                return
+            # A keypress only means something inside a call. ANSWERING counts:
+            # the INFO can arrive before the ACK that moves us to IN_CALL.
+            if self.state not in (SipState.IN_CALL, SipState.ANSWERING):
+                _LOGGER.debug("DTMF '%s' via SIP INFO ignored in state %s", digit, self.state)
                 return
             _LOGGER.debug("DTMF '%s' received via SIP INFO", digit)
             self._on_rx_dtmf(digit)
