@@ -208,6 +208,7 @@ class AssistBridge(AudioSink):
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
+        interrupt_media: bool = False,
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
         user_id: str | None = None,
@@ -232,6 +233,7 @@ class AssistBridge(AudioSink):
         self.silence_seconds = silence_seconds
         self.noise_suppression = noise_suppression
         self.turn_tone = turn_tone
+        self._interrupt_media_pending = interrupt_media
         self.stop_audio_fn = stop_audio_fn
         self.media_playing_fn = media_playing_fn
         self._context = Context(user_id=user_id)
@@ -401,6 +403,15 @@ class AssistBridge(AudioSink):
                 _TX_IDLE_TIMEOUT_SECONDS,
             )
 
+    def _interrupt_media_when_ready(self) -> None:
+        """Stop pre-Assist media at the first listening/playback boundary."""
+        if not self._interrupt_media_pending:
+            return
+        self._interrupt_media_pending = False
+        if self.stop_audio_fn:
+            # Sources are paced ahead into RTP, so discard queued PCM too.
+            self.stop_audio_fn(flush=True)
+
     def _monitor_barge_in(self, pcm_16k: bytes) -> None:
         """Detect caller speech during TTS playback and trigger barge-in."""
         self._append_rx_to_ring(pcm_16k)
@@ -502,6 +513,7 @@ class AssistBridge(AudioSink):
                     await self._play_turn_tone()
                     if not self._running:
                         break
+                self._interrupt_media_when_ready()
                 preroll = self._take_preroll()
                 if preroll:
                     self.audio_stream.inject_preroll(preroll)
@@ -631,6 +643,7 @@ class AssistBridge(AudioSink):
         timed_out = False
         played = False
         try:
+            self._interrupt_media_when_ready()
             await self._wait_for_tx_idle()
             if not self._running:
                 return
@@ -745,6 +758,8 @@ class AssistBridge(AudioSink):
                 if callable(aclose):
                     await aclose()
                 return
+
+            self._interrupt_media_when_ready()
 
             async def chunks() -> AsyncIterable[bytes]:
                 if first:

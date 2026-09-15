@@ -3943,6 +3943,37 @@ def test_assist_tts_starts_before_stream_completes():
     assert played == ["FfmpegAudioSource"]
 
 
+def test_assist_interrupts_media_only_when_first_tts_audio_is_ready():
+    assist_mod, _, _, _ = _assist_ctx()
+    first_chunk_ready = asyncio.Event()
+    calls: list[str] = []
+
+    async def delayed_stream():
+        await first_chunk_ready.wait()
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = delayed_stream
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda src: calls.append("play"),
+            on_done_fn=MagicMock(),
+            interrupt_media=True,
+            stop_audio_fn=lambda **kwargs: calls.append(f"stop:{kwargs['flush']}"),
+        )
+        task = asyncio.create_task(bridge._play_tts_stream(stream, epoch=0))
+        await asyncio.sleep(0.02)
+        assert calls == []
+
+        first_chunk_ready.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run())
+    assert calls == ["stop:True", "play"]
+
+
 def test_assist_playback_timeout_does_not_stop_long_playback():
     assist_mod, _, _, _ = _assist_ctx()
     stop_calls = []

@@ -274,7 +274,7 @@
         },
         "interrupt_media": {
           "name": "Medienwiedergabe unterbrechen",
-          "description": "Aktuelle Medienwiedergabe vor dem Start von Assist stoppen und verwerfen. Deaktivieren, um auf das Ende der Wiedergabe zu warten."
+          "description": "Aktuelle Medienwiedergabe stoppen und verwerfen, sobald Assist zum Zuhören oder Abspielen der ersten Antwort bereit ist. Während Pipeline-, LLM- und TTS-Start kann die Wiedergabe weiterlaufen."
         },
         "allowed_callers": {
           "name": "Erlaubte Anrufer",

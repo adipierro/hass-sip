@@ -565,11 +565,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             client.remove_sink(assist_bridge)
             assist_bridge.close()
 
-        if interrupt_media:
-            # Sources are paced ahead into RTP, so flush as well as cancel to
-            # let Assist listen or play its opening response immediately.
-            client.stop_audio(flush=True)
-
         bridge = AssistBridge(
             hass,
             play_source_fn=client.play_source,
@@ -586,6 +581,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             noise_suppression=noise_suppression,
             turn_tone=turn_tone,
             hangup_on_end=hangup_on_end,
+            interrupt_media=interrupt_media,
             stop_audio_fn=client.stop_audio,
             media_playing_fn=lambda: client.media_playing,
             user_id=assist_user_id,
