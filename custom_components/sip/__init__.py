@@ -23,6 +23,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_extract_config_entry_ids
 
 from .assist import AssistBridge
@@ -129,21 +130,33 @@ PLATFORMS = [
     Platform.BUTTON,
 ]
 
+CONTACT_REFRESH_INTERVAL = datetime.timedelta(seconds=5)
 
-def load_contacts(hass: HomeAssistant) -> dict[str, Any]:
-    """Load contacts from the JSON file."""
+
+def load_contacts(hass: HomeAssistant) -> dict[str, Any] | None:
+    """Load contacts from the JSON file.
+
+    Returns ``{}`` when the file does not exist and ``None`` when it exists
+    but cannot be read or is not a JSON object (e.g. a half-written save),
+    so callers can keep the previous cache instead of wiping it.
+    """
     import json
     import os
 
     config_dir = hass.config.path()
     contacts_file = os.path.join(config_dir, "sip_contacts.json")
-    if os.path.exists(contacts_file):
-        try:
-            with open(contacts_file, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    if not os.path.exists(contacts_file):
+        return {}
+    try:
+        with open(contacts_file, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("Could not read %s: %s", contacts_file, err)
+        return None
+    if not isinstance(data, dict):
+        LOGGER.debug("%s is not a JSON object", contacts_file)
+        return None
+    return data
 
 
 def get_contact_info_from_cache(
@@ -156,6 +169,29 @@ def get_contact_info_from_cache(
     elif isinstance(info, str):
         return info, False
     return number, False
+
+
+async def async_refresh_contacts(
+    hass: HomeAssistant, runtime_data: dict[str, Any]
+) -> None:
+    """Reload contacts outside the event loop and replace the shared cache.
+
+    A file that is momentarily unreadable (an editor mid-save, invalid JSON)
+    leaves the last good cache in place; only a deleted file empties it.
+    """
+    contacts = await hass.async_add_executor_job(load_contacts, hass)
+    if contacts is None:
+        # Warn once per outage; the periodic refresh would otherwise repeat
+        # this every few seconds until the file is fixed.
+        if not runtime_data.get("contacts_stale"):
+            LOGGER.warning(
+                "sip_contacts.json could not be parsed; keeping the previous contacts"
+            )
+            runtime_data["contacts_stale"] = True
+        return
+    if runtime_data.pop("contacts_stale", False):
+        LOGGER.info("sip_contacts.json loaded again")
+    runtime_data["contacts"] = contacts
 
 
 # Service Schemas
@@ -245,6 +281,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Load contacts asynchronously from file to avoid blocking event loop on startup
     contacts = await hass.async_add_executor_job(load_contacts, hass)
+    if contacts is None:
+        LOGGER.warning("sip_contacts.json could not be parsed; starting without contacts")
+        contacts = {}
     assist_user_id = await ensure_assist_user(hass, entry)
 
     entry.runtime_data = {
@@ -264,6 +303,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "call_number": "",
         "pin_collector": None,
     }
+
+    async def refresh_contacts(_now=None) -> None:
+        await async_refresh_contacts(hass, entry.runtime_data)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, refresh_contacts, CONTACT_REFRESH_INTERVAL)
+    )
 
     # Active session state helpers
     ivr_session: IvrSession | None = None
@@ -334,13 +380,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def on_incoming_call(caller: str) -> None:
         LOGGER.info("[%s] Incoming call from %s", sip_config.username, caller)
-
-        # Reload contacts in background so any manual edits are picked up dynamically
-        def reload_contacts_bg():
-            contacts_data = load_contacts(hass)
-            entry.runtime_data["contacts"] = contacts_data
-
-        hass.async_add_executor_job(reload_contacts_bg)
 
         caller_name, auto_answer = get_contact_info_from_cache(
             entry.runtime_data.get("contacts", {}), caller
@@ -809,9 +848,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
             data["call_status"] = "canceled"
             data["call_number"] = number
 
-            # Load contacts asynchronously and cache them
-            contacts_data = await hass.async_add_executor_job(load_contacts, hass)
-            data["contacts"] = contacts_data
+            # Pick up any edits before resolving the callee's name.
+            await async_refresh_contacts(hass, data)
+            contacts_data = data.get("contacts", {})
 
             friendly_name, _ = get_contact_info_from_cache(contacts_data, number)
             data["last_caller"] = friendly_name
