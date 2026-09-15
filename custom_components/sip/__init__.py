@@ -254,6 +254,7 @@ SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
         ),
         vol.Optional("turn_tone"): cv.boolean,
         vol.Optional("hangup_on_end"): cv.boolean,
+        vol.Optional("interrupt_media", default=True): cv.boolean,
         vol.Optional("allowed_callers"): vol.All(cv.ensure_list, [cv.string]),
         vol.Optional("contacts_only"): cv.boolean,
         vol.Optional("pin"): cv.string,
@@ -603,6 +604,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
+        interrupt_media: bool = True,
     ) -> None:
         nonlocal assist_bridge
         if assist_bridge is not None:
@@ -625,6 +627,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             noise_suppression=noise_suppression,
             turn_tone=turn_tone,
             hangup_on_end=hangup_on_end,
+            interrupt_media=interrupt_media,
             stop_audio_fn=client.stop_audio,
             media_playing_fn=lambda: client.media_playing,
             user_id=assist_user_id,
@@ -1058,6 +1061,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "noise_suppression",
                 "turn_tone",
                 "hangup_on_end",
+                "interrupt_media",
             )
             if k in call.data
         }

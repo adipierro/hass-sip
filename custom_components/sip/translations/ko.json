@@ -272,6 +272,10 @@
           "name": "종료 시 끊기",
           "description": "Assist 세션 종료 시 통화를 끊습니다."
         },
+        "interrupt_media": {
+          "name": "미디어 중단",
+          "description": "Assist가 듣기 또는 첫 응답 재생을 시작할 준비가 되면 현재 미디어 재생을 중지하고 버립니다. 파이프라인, LLM 및 TTS 준비 중에는 미디어가 계속 재생될 수 있습니다. false로 두면 현재 재생이 끝난 뒤 Assist의 첫 턴이 시작됩니다."
+        },
         "allowed_callers": {
           "name": "허용 발신자",
           "description": "Assist를 시작할 수 있는 발신자 번호. 생략하면 제한 없음. Caller ID는 스푸핑될 수 있으므로 도어락 intent에는 PIN을 함께 쓰세요."

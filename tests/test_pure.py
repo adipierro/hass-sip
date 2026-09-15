@@ -4089,6 +4089,9 @@ def test_assist_initial_prompt_barge_in_becomes_first_turn_preroll():
                 on_done_fn=MagicMock(),
                 initial_prompt="Greet the caller",
                 barge_in=True,
+                # This test counts the barge-in stop; keep the media
+                # interrupt (a separate stop_audio(flush=True)) out of it.
+                interrupt_media=False,
                 stop_audio_fn=stop_audio,
                 max_turns=1,
             )
@@ -4208,6 +4211,7 @@ def test_start_assist_service_accepts_and_forwards_prompts():
     assert service_data["conversation_id"] == "existing-conversation"
     assert service_data["initial_prompt"] == "Greet the caller"
     assert service_data["system_prompt"] == "Keep answers concise"
+    assert service_data["interrupt_media"] is True
 
     trigger_assist = AsyncMock()
     entry = MagicMock()
@@ -4239,6 +4243,7 @@ def test_start_assist_service_accepts_and_forwards_prompts():
         conversation_id="existing-conversation",
         initial_prompt="Greet the caller",
         system_prompt="Keep answers concise",
+        interrupt_media=True,
     )
 
 
@@ -4381,6 +4386,99 @@ def test_assist_tts_starts_before_stream_completes():
 
     played = asyncio.run(run())
     assert played == ["FfmpegAudioSource"]
+
+
+def test_assist_interrupts_media_only_when_first_tts_audio_is_ready():
+    assist_mod, _, _, _ = _assist_ctx()
+    first_chunk_ready = asyncio.Event()
+    calls: list[str] = []
+
+    async def delayed_stream():
+        await first_chunk_ready.wait()
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = delayed_stream
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda src: calls.append("play"),
+            on_done_fn=MagicMock(),
+            interrupt_media=True,
+            stop_audio_fn=lambda **kwargs: calls.append(f"stop:{kwargs['flush']}"),
+        )
+        task = asyncio.create_task(bridge._play_tts_stream(stream, epoch=0))
+        await asyncio.sleep(0.02)
+        assert calls == []
+
+        first_chunk_ready.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run())
+    assert calls == ["stop:True", "play"]
+
+
+def test_assist_interrupt_media_false_waits_for_current_playback():
+    """Opt-out keeps the old behavior: no stop, TTS waits for TX idle."""
+    assist_mod, _, _, _ = _assist_ctx()
+    calls: list[str] = []
+    playing = [True]
+
+    async def stream_result():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_result
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda src: calls.append("play"),
+            on_done_fn=MagicMock(),
+            interrupt_media=False,
+            stop_audio_fn=lambda **kwargs: calls.append("stop"),
+            media_playing_fn=lambda: playing[0],
+        )
+        task = asyncio.create_task(bridge._play_tts_stream(stream, epoch=0))
+        await asyncio.sleep(0.05)
+        assert calls == []  # still waiting for the previous media to drain
+        playing[0] = False
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run())
+    assert calls == ["play"]
+
+
+def test_assist_interrupts_media_before_turn_tone():
+    """Listening path: the one-shot fires before the tone's TX-idle wait, and
+    not again on later turns."""
+    assist_mod, _, _, _ = _assist_ctx()
+    calls: list[str] = []
+
+    holder: dict = {}
+
+    def play(_src):
+        calls.append("play")
+        holder["bridge"]._tx_done.set()  # the tone "finishes" immediately
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=play,
+            on_done_fn=MagicMock(),
+            turn_tone=True,
+            interrupt_media=True,
+            stop_audio_fn=lambda **kwargs: calls.append(f"stop:{kwargs['flush']}"),
+            media_playing_fn=lambda: False,
+        )
+        holder["bridge"] = bridge
+        bridge._running = True
+        await bridge._play_turn_tone()
+        await bridge._play_turn_tone()
+
+    asyncio.run(run())
+    assert calls == ["stop:True", "play", "play"]
 
 
 def test_assist_playback_timeout_does_not_stop_long_playback():

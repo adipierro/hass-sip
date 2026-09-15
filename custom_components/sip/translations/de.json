@@ -272,6 +272,10 @@
           "name": "Bei Ende auflegen",
           "description": "Anruf beenden, wenn die Assist-Sitzung endet."
         },
+        "interrupt_media": {
+          "name": "Medienwiedergabe unterbrechen",
+          "description": "Aktuelle Medienwiedergabe stoppen und verwerfen, sobald Assist zum Zuhören oder Abspielen der ersten Antwort bereit ist. Während Pipeline-, LLM- und TTS-Start kann die Wiedergabe weiterlaufen. Auf false setzen, damit die aktuelle Wiedergabe vor der ersten Assist-Runde zu Ende läuft."
+        },
         "allowed_callers": {
           "name": "Erlaubte Anrufer",
           "description": "Anrufer-IDs, die Assist starten dürfen. Ohne Angabe keine Einschränkung. Caller-ID ist fälschbar; für Türschloss-Intents zusätzlich PIN verwenden."
