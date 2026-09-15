@@ -23,7 +23,7 @@
 - 이미 통과하는 테스트. 기존 테스트를 수정해야 한다면 그건 행동 변경이므로
   PR 설명에 이유를 명시한다.
 - 라우팅/트랜잭션 처리(strict/loose router, Record-Route, forked 2xx, CANCEL 경합).
-  실제 이슈를 갚아온 코드이므로 "정리"하지 않는다.
+  실제 이슈를 갚아온 코드이므로 "정리"하지 않는다. 버그 수정은 예외다(#83 대화 격리).
 
 ### 지킬 것
 
@@ -31,7 +31,8 @@
   전용 테스트 파일).
 - SIP core에는 `homeassistant` import 금지. 새 기능이 HA를 필요로 하면 콜백/주입으로 뺀다.
 - 이벤트 루프에서 블로킹 I/O 금지(파일, 소켓, subprocess 대기).
-- 로그에 크리덴셜, `Authorization` 헤더 값, digest response를 절대 남기지 않는다.
+- 로그·버스 이벤트·로그북에 크리덴셜, `Authorization` 값, digest response,
+  미디어 URL/`authSig`를 절대 남기지 않는다.
 - `ruff check custom_components/` 통과. CI는 Python 3.14, Home Assistant 최솟값은
   `hacs.json` (`homeassistant`, 현재 `2026.9.0`).
 - 사용자에게 보이는 동작이 바뀌면 `strings.json` + `translations/{en,ko,de,ru}.json`을
@@ -54,11 +55,14 @@ SIP core는 HA 없이 단독 로드할 수 있다. `tests/test_pure.py` 상단�
 
 ### [ ] P3-5. RTP TX를 버퍼 점유량으로 페이싱
 
-**근거** #46 리뷰: `_RealtimePacer`는 벽시계 0.5 s 리드이고 `_sender`는 늦으면
-프레임을 따라잡지 않고 시계만 맞춘다. 점유가 1 s를 넘으면 앞에서 드롭.
-`sip.dial` TTS가 2.0.1 이후에도 끊기면 이 층이다.
+**근거** #46(머지됨) 리뷰: `_RealtimePacer`는 벽시계 0.5 s 리드이고 `_sender`는
+늦으면 프레임을 따라잡지 않고 시계만 맞춘다. 점유가 1 s를 넘으면 앞에서 드롭.
 
-**작업** (리포터 재확인 또는 로컬 재현 후에만)
+#45 리포터는 2.0.1에서 TTS가 크게 좋아졌다고 했고, G.711이 G.722보다 조금 나을
+수는 있으나 확실하지 않다고 했다. 3.x 재테스트는 아직 없다. `sip.dial` TTS가
+**3.1.0에서도** 끊기면 이 층이다.
+
+**작업** (3.1.0 재확인 또는 로컬 재현 후에만)
 - 페이서를 `len(_tx_buffer)` 기준으로 바꿔 AudioSource가 TX 백로그를 보게 한다.
 - RTP 트레이스에 컴포트 사일런스 vs 실음 프레임 비율을 남겨 트레이스만으로
   끊김을 구분할 수 있게 한다.
@@ -121,4 +125,6 @@ SIP core는 HA 없이 단독 로드할 수 있다. `tests/test_pure.py` 상단�
 ## 5. 참고
 
 이 저장소 이슈: #16(answer/hangup), #17(407), #20(423), #23(DTMF), #28(재설정),
-#39(3CX SBC Record-Route), #41·#42·#44(Assist), #45(choppy TTS, 리포터 재확인 대기).
+#39(3CX SBC Record-Route), #41·#42·#44(Assist), #45(choppy TTS: 2.0.1에서 크게
+개선, 3.x 재테스트 대기), #46(TX 페이싱, 머지됨). 3.1.0의 재생/대화/권한 수정
+(#79–#89)은 카드가 아니라서 여기에 남기지 않는다.
