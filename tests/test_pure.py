@@ -399,7 +399,11 @@ def test_ffmpeg_source_raises_with_bounded_stderr_on_decoder_failure():
 
 
 def test_ffmpeg_source_rejects_successful_empty_output():
-    script = "#!" + sys.executable + "\n"
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        "sys.stderr.write('Server returned 401 Unauthorized\\n')\n"
+    )
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
         fh.write(script)
         path = fh.name
@@ -414,10 +418,80 @@ def test_ffmpeg_source_rejects_successful_empty_output():
             asyncio.run(main())
         except RuntimeError as err:
             assert "produced no audio" in str(err)
+            # exit 0 with no PCM still carries ffmpeg's diagnostics
+            assert "401 Unauthorized" in str(err)
         else:
             raise AssertionError("expected empty-output failure")
     finally:
         os.unlink(path)
+
+
+def test_ffmpeg_source_stderr_tail_is_bounded():
+    limit = audio._FFMPEG_STDERR_LIMIT
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys\n"
+        f"sys.stderr.write('HEAD' + 'x' * {limit * 2} + 'TAIL')\n"
+        "raise SystemExit(1)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        await source.run(lambda _chunk: None, lambda: True)
+
+    try:
+        try:
+            asyncio.run(main())
+        except RuntimeError as err:
+            msg = str(err)
+            assert msg.endswith("TAIL")
+            assert "HEAD" not in msg
+            assert len(msg) <= limit + len("ffmpeg exited with status 1: ")
+        else:
+            raise AssertionError("expected ffmpeg failure")
+    finally:
+        os.unlink(path)
+
+
+def test_ffmpeg_source_caller_stop_is_not_a_failure():
+    """A source ended by is_active() -> False (hangup, stop_audio) must
+    return quietly: the nonzero exit status comes from our own kill."""
+    script = (
+        "#!" + sys.executable + "\n"
+        "import sys, time\n"
+        "out = sys.stdout.buffer\n"
+        "while True:\n"
+        "    out.write(b'\\x00' * 320)\n"
+        "    out.flush()\n"
+        "    time.sleep(0.005)\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(script)
+        path = fh.name
+    os.chmod(path, 0o755)
+
+    pushed: list[bytes] = []
+    polls = 0
+
+    def is_active():
+        nonlocal polls
+        polls += 1
+        return polls <= 3
+
+    async def main():
+        source = audio.FfmpegAudioSource(ffmpeg_bin=path, url="ignored")
+        source.configure(8000, 320)
+        await asyncio.wait_for(source.run(pushed.append, is_active), timeout=5)
+
+    try:
+        asyncio.run(main())  # must not raise
+    finally:
+        os.unlink(path)
+    assert pushed
 
 
 def test_failed_audio_source_does_not_emit_playback_done():

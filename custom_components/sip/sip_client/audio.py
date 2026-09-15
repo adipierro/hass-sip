@@ -38,6 +38,10 @@ _PCM_PREBUFFER_SEC = 0.5
 # a source may dump in one burst (0.5 + 0.5 = 1.0 s), matching the TX cap.
 _PCM_MAX_BEHIND_SEC = _PCM_PREBUFFER_SEC
 _FFMPEG_STDERR_LIMIT = 8192
+# After ffmpeg closes stdout it should exit on its own almost immediately.
+# Wait this long for a meaningful exit status before killing a straggler
+# (e.g. one blocked on stdin or a hung filter).
+_FFMPEG_EXIT_TIMEOUT_SEC = 2.0
 
 
 def default_pcm_frame_bytes(sample_rate: int) -> int:
@@ -341,6 +345,7 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
         stderr_task = asyncio.create_task(self._read_stderr(proc.stderr))
         reached_eof = False
         pcm_bytes = 0
+        stderr = b""
         try:
             if self._chunks is not None and proc.stdin is not None:
                 feeder = asyncio.create_task(self._feed_stdin(proc.stdin))
@@ -377,20 +382,34 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
                     await feeder
                 except asyncio.CancelledError:
                     pass
-            if proc.returncode is None and not reached_eof:
+            if proc.returncode is None and reached_eof:
+                # stdout closed: let ffmpeg finish so its exit status is real.
+                try:
+                    await asyncio.wait_for(proc.wait(), _FFMPEG_EXIT_TIMEOUT_SEC)
+                except TimeoutError:
+                    pass
+            if proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            await proc.wait()
-            stderr = await stderr_task
+            try:
+                await proc.wait()
+                stderr = await stderr_task
+            finally:
+                if not stderr_task.done():
+                    stderr_task.cancel()
 
+        if not reached_eof:
+            # The caller stopped playback (hangup, stop_audio, codec change).
+            # We killed ffmpeg ourselves, so its exit status means nothing.
+            return
+        detail = stderr.decode(errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
         if proc.returncode:
-            detail = stderr.decode(errors="replace").strip()
-            suffix = f": {detail}" if detail else ""
             raise RuntimeError(f"ffmpeg exited with status {proc.returncode}{suffix}")
         if pcm_bytes == 0:
-            raise RuntimeError("ffmpeg produced no audio")
+            raise RuntimeError(f"ffmpeg produced no audio{suffix}")
 
     @staticmethod
     async def _read_stderr(stderr: asyncio.StreamReader) -> bytes:
