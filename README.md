@@ -13,6 +13,7 @@ Transport is **SIP over UDP** with **G.711 (PCMU/PCMA) and G.722**. TLS, SRTP, a
 |---|---|---|
 | [Setup & Quick Start](docs/setup.md) | [Examples](docs/examples.md) | [Services, entities, events](docs/services.md) |
 | [PBX compatibility](docs/setup.md#pbx-compatibility) | [Security](docs/security.md) | [Troubleshooting](docs/troubleshooting.md) |
+| [ESPHome Component](#esphome-external-component) | [Intercom example](docs/examples.md#intercom--auto-answer-mode) | [espcomponents repo](https://github.com/eigger/espcomponents/tree/master/components/sip_client#readme) |
 
 ## What it is for
 
@@ -69,6 +70,8 @@ Door station rings → hass-sip answers immediately → optional DTMF to open th
 
 Put that in `sip_contacts.json` (or send SIP auto-answer headers). [Intercom details](docs/examples.md#intercom--auto-answer-mode).
 
+> **DIY Hardware**: Looking to build an ESP32-based intercom or doorbell? Check out the [ESPHome External Component](#esphome-external-component).
+
 ### Home Assistant calls you with TTS
 
 An automation dials your phone, speaks a message when you answer, then hangs up — package delivery, garage open too long, alarm, and so on.
@@ -110,6 +113,14 @@ Field list, firewall notes, and the pjsip snippet: **[Setup](docs/setup.md)**.
 - IVR trees with DTMF, PIN, and Home Assistant service actions
 - G.722 (16 kHz) when the far end offers it, otherwise G.711
 - Sensors: registration, last caller, codec, audio path (`none` / `no_rx` / `no_tx` / `bidirectional`)
+
+## ESPHome External Component
+
+Looking to build a DIY physical endpoint — such as an ESP32 intercom, doorbell, or paging speaker?
+
+Check out the ESPHome external component: [**`sip_client` in eigger/espcomponents**](https://github.com/eigger/espcomponents/tree/master/components/sip_client#readme).
+
+It registers an ESP32 as a SIP extension on your PBX with support for ESPHome standard `microphone` and `speaker` (I2S audio), G.711 / wideband G.722 codecs, DTMF, and full or half-duplex modes. Full configuration, hardware wiring, and YAML examples are documented in the [espcomponents repository](https://github.com/eigger/espcomponents/tree/master/components/sip_client#readme).
 
 ## Security
 
