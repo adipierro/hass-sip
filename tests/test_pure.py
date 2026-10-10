@@ -5657,6 +5657,10 @@ def test_assist_barge_in_resumes_after_grace_and_keeps_grace_audio():
         )
         bridge2._speaking = True
         bridge2._tts_armed_at = 100.0
+        with patch.object(assist_mod, "_monotonic", return_value=101.0):
+            for _ in range(100):  # grow the ring inside the grace window
+                bridge2.write(frame)
+        assert len(bridge2._ring_buffer) > assist_mod._PREROLL_MAX_BYTES
         with patch.object(assist_mod, "_monotonic", return_value=110.0):
             for _ in range(250):
                 bridge2.write(frame)
