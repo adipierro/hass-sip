@@ -6166,7 +6166,7 @@ def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
     assert direct_tool.annotations.read_only is False
     assert direct_tool.annotations.destructive is True
     assert direct_tool.annotations.idempotent is True
-    assert direct_tool.annotations.open_world is True
+    assert direct_tool.annotations.open_world is False
     assert "assist__sip__hang_up_current_call" in tools.prompt
     assert "sip__hang_up_current_call" in tools.prompt
 
