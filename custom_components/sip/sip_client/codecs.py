@@ -2,7 +2,8 @@
 
 One Codec entry per negotiable payload type. SDP generation, codec selection and
 the RTP receive gate are all derived from SUPPORTED, so adding a codec is a
-one-line change here.
+one-line change here. The user-selectable subset and order (``PRESETS``) only
+narrows what we offer and pick; the receive path stays lenient.
 
 Stateful codecs (G.722) need per-call encoder/decoder instances. Codec exposes
 ``new_encoder`` / ``new_decoder`` factories; G.711 returns stateless adapters.
@@ -110,11 +111,44 @@ SUPPORTED: tuple[Codec, ...] = (G722, PCMU, PCMA)
 BY_PT: dict[int, Codec] = {c.payload_type: c for c in SUPPORTED}
 DEFAULT: Codec = PCMU
 
+# User-selectable offer order / preference. ``auto`` is the historic behaviour.
+# Every preset keeps PCMU so ``DEFAULT`` is always an allowed fallback.
+PRESETS: dict[str, tuple[Codec, ...]] = {
+    "auto": SUPPORTED,
+    "g711_pcmu_first": (PCMU, PCMA, G722),
+    "g711_pcma_first": (PCMA, PCMU, G722),
+    "g711_only_pcmu_first": (PCMU, PCMA),
+    "g711_only_pcma_first": (PCMA, PCMU),
+}
+DEFAULT_PRESET = "auto"
+
+
+def fallback(order: tuple[Codec, ...]) -> Codec:
+    """Codec to assume when the remote has not offered anything yet."""
+    return DEFAULT if order is SUPPORTED else order[0]
+
+
+def has_audio_offer(sdp: SdpInfo) -> bool:
+    """True when the SDP lists audio payloads beyond telephone-event / static CN."""
+    if max(sdp.pcmu_pt, sdp.pcma_pt, sdp.g722_pt) >= 0:
+        return True
+    ignored = {sdp.telephone_event_pt, 13}  # telephone-event, static CN
+    return any(pt not in ignored for pt in sdp.offered_pts)
+
+
+def preset_order(name: str | None) -> tuple[Codec, ...]:
+    """Ordered codecs for a preset name; unknown or missing means ``auto``."""
+    return PRESETS.get(name or DEFAULT_PRESET, SUPPORTED)
+
 TELEPHONE_EVENT_PT = 101
 
 
-def choose(sdp: SdpInfo) -> Codec:
-    """Pick the most preferred codec the remote also offered.
+def choose(sdp: SdpInfo, order: tuple[Codec, ...] = SUPPORTED) -> Codec | None:
+    """Pick the most preferred codec in ``order`` that the remote also offered.
+
+    Returns ``None`` when the remote offered audio but nothing in ``order``
+    (answering with a codec it never listed would break RFC 3264). An SDP with
+    no audio payloads at all falls back to :func:`fallback`.
 
     Prefers a static payload type present in ``offered_pts``. If the remote only
     advertised a codec under a dynamic PT (``a=rtpmap:96 PCMU/8000``), fall back
@@ -125,17 +159,21 @@ def choose(sdp: SdpInfo) -> Codec:
         "PCMU": sdp.pcmu_pt,
         "PCMA": sdp.pcma_pt,
     }
-    for codec in SUPPORTED:
+    for codec in order:
         if codec.payload_type in sdp.offered_pts:
             return codec
-    for codec in SUPPORTED:
+    for codec in order:
         npt = named.get(codec.name, -1)
         if npt >= 0:
             return codec.with_payload_type(npt)
-    return DEFAULT
+    if has_audio_offer(sdp):
+        return None
+    return fallback(order)
 
 
-def keep_or_choose(current: Codec, sdp: SdpInfo) -> Codec:
+def keep_or_choose(
+    current: Codec, sdp: SdpInfo, order: tuple[Codec, ...] = SUPPORTED
+) -> Codec | None:
     """Keep ``current`` when the offer still lists it; otherwise :func:`choose`.
 
     A mid-dialog refresh that still advertises the negotiated codec must not
@@ -144,7 +182,11 @@ def keep_or_choose(current: Codec, sdp: SdpInfo) -> Codec:
 
     Dynamic payload types (>= 96) are matched by codec name, not number:
     the same PT can be PCMU in one offer and G.722 in the next.
+    A codec outside ``order`` is never kept. ``None`` means the offer has no
+    codec we allow; the caller should reject it and leave the session alone.
     """
+    if current.name not in {c.name for c in order}:
+        return choose(sdp, order)
     named = {
         "G722": sdp.g722_pt,
         "PCMU": sdp.pcmu_pt,
@@ -160,21 +202,25 @@ def keep_or_choose(current: Codec, sdp: SdpInfo) -> Codec:
         return current.with_payload_type(npt)
     if not sdp.offered_pts and sdp.pcmu_pt < 0 and sdp.pcma_pt < 0 and sdp.g722_pt < 0:
         return current
-    return choose(sdp)
+    return choose(sdp, order)
 
 
-def sdp_media_line(port: int, only: Codec | None = None) -> str:
+def sdp_media_line(
+    port: int, only: Codec | None = None, order: tuple[Codec, ...] = SUPPORTED
+) -> str:
     """Build the ``m=audio`` line. Pass ``only`` to answer with one codec (RFC 3264)."""
     if only is not None:
         pts = str(only.payload_type)
     else:
-        pts = " ".join(str(c.payload_type) for c in SUPPORTED)
+        pts = " ".join(str(c.payload_type) for c in order)
     return f"m=audio {port} RTP/AVP {pts} {TELEPHONE_EVENT_PT}\r\n"
 
 
-def sdp_rtpmaps(only: Codec | None = None) -> str:
+def sdp_rtpmaps(
+    only: Codec | None = None, order: tuple[Codec, ...] = SUPPORTED
+) -> str:
     """Build ``a=rtpmap`` lines. Pass ``only`` for a single-codec answer."""
-    entries = (only,) if only is not None else SUPPORTED
+    entries = (only,) if only is not None else order
     lines = "".join(
         f"a=rtpmap:{c.payload_type} {c.name}/{c.clock_rate}\r\n" for c in entries
     )
