@@ -6,8 +6,7 @@ from typing import override
 
 from homeassistant.components.llm import LLMTools
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.llm import LLM_API_ASSIST, LLMContext, Tool, ToolInput
-from homeassistant.util.json import JsonObjectType
+from homeassistant.helpers import llm
 
 from .assist import AssistBridge
 from .const import (
@@ -18,14 +17,22 @@ from .const import (
 from .sip_client.sip_client import SipClient, SipState
 
 
-class SipHangUpCurrentCallTool(Tool):
+class SipHangUpCurrentCallTool(llm.Tool):
     """Queue hang-up for the SIP call that created this Assist request."""
 
     name = ASSIST_HANGUP_TOOL_NAME
+    title = "Hang up current SIP call"
     description = (
         "End this phone call after the current Assist reply finishes. "
         "Call this when the caller asks to hang up. You may complete other "
         "requested actions and say a brief goodbye in this turn."
+    )
+    integration = DOMAIN
+    annotations = llm.ToolAnnotations(
+        read_only=False,
+        destructive=True,
+        idempotent=True,
+        open_world=True,
     )
 
     def __init__(
@@ -39,7 +46,7 @@ class SipHangUpCurrentCallTool(Tool):
         self._bridge = bridge
         self._client = client
 
-    def _is_current_call(self, llm_context: LLMContext) -> bool:
+    def _is_current_call(self, llm_context: llm.LLMContext) -> bool:
         """Reject a tool retained after the SIP call or Assist bridge changes."""
         get_assist = self._entry_data.get("get_assist")
         return bool(
@@ -57,23 +64,27 @@ class SipHangUpCurrentCallTool(Tool):
     async def async_call(
         self,
         hass: HomeAssistant,
-        tool_input: ToolInput,
-        llm_context: LLMContext,
-    ) -> JsonObjectType:
+        tool_input: llm.ToolInput,
+        llm_context: llm.LLMContext,
+    ) -> llm.ToolResult:
         """Schedule BYE after intent processing and outbound audio finish."""
         if not self._is_current_call(llm_context):
-            return {"success": False, "error": "SIP call is no longer active"}
+            return llm.ToolResult(
+                data={"error": "SIP call is no longer active"}, error=True
+            )
         if not self._bridge.request_hangup_after_turn():
-            return {"success": False, "error": "SIP hang-up is unavailable"}
-        return {"success": True, "result": {"status": "scheduled_after_turn"}}
+            return llm.ToolResult(
+                data={"error": "SIP hang-up is unavailable"}, error=True
+            )
+        return llm.ToolResult(data={"status": "scheduled_after_turn"})
 
 
 @callback
 def async_get_tools(
-    hass: HomeAssistant, llm_context: LLMContext, api_id: str
+    hass: HomeAssistant, llm_context: llm.LLMContext, api_id: str
 ) -> LLMTools | None:
     """Expose Hang Up only to an opted-in, active SIP Assist call."""
-    if api_id != LLM_API_ASSIST or llm_context.device_id is None:
+    if api_id != llm.LLM_API_ASSIST or llm_context.device_id is None:
         return None
 
     for entry in hass.config_entries.async_entries(DOMAIN):

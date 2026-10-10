@@ -6003,10 +6003,20 @@ def test_assist_hangup_tool_call_schedules_even_if_core_cannot_dispatch_it():
         bridge._on_pipeline_event(
             PE(
                 PET.INTENT_PROGRESS,
-                {"chat_log_delta": {"role": "tool_result", "tool_result": {
-                    "error": "HomeAssistantError",
-                    "error_text": 'Tool "sip__hang_up_current_call" not found',
-                }}},
+                {
+                    "chat_log_delta": {
+                        "role": "tool_result",
+                        "result": {
+                            "data": {
+                                "error": "HomeAssistantError",
+                                "error_text": (
+                                    'Tool "sip__hang_up_current_call" not found'
+                                ),
+                            },
+                            "error": True,
+                        },
+                    },
+                },
             )
         )
         assert bridge._hangup_requested is True
@@ -6106,11 +6116,17 @@ def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
     llm_helpers.LLMContext = type("LLMContext", (), {})
     llm_helpers.Tool = type("Tool", (), {})
     llm_helpers.ToolInput = type("ToolInput", (), {})
-    llm_json = types.ModuleType("homeassistant.util.json")
-    llm_json.JsonObjectType = dict
+    llm_helpers.ToolAnnotations = lambda **kwargs: types.SimpleNamespace(**kwargs)
+
+    class ToolResult:
+        def __init__(self, *, data, error=False):
+            self.data = data
+            self.error = error
+
+    llm_helpers.ToolResult = ToolResult
     monkeypatch.setitem(sys.modules, "homeassistant.components.llm", llm_component)
     monkeypatch.setitem(sys.modules, "homeassistant.helpers.llm", llm_helpers)
-    monkeypatch.setitem(sys.modules, "homeassistant.util.json", llm_json)
+    monkeypatch.setattr(sys.modules["homeassistant.helpers"], "llm", llm_helpers)
 
     module_name = f"{_CC_PKG}._llm_platform_test"
     spec = importlib.util.spec_from_file_location(
@@ -6145,6 +6161,12 @@ def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
     assert direct_tool._is_current_call(context)
     tools = platform.async_get_tools(hass, context, "assist")
     assert [tool.name for tool in tools.tools] == ["sip__hang_up_current_call"]
+    assert direct_tool.title == "Hang up current SIP call"
+    assert direct_tool.integration == "sip"
+    assert direct_tool.annotations.read_only is False
+    assert direct_tool.annotations.destructive is True
+    assert direct_tool.annotations.idempotent is True
+    assert direct_tool.annotations.open_world is True
     assert "assist__sip__hang_up_current_call" in tools.prompt
     assert "sip__hang_up_current_call" in tools.prompt
 
@@ -6152,10 +6174,17 @@ def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
         result = await tools.tools[0].async_call(
             hass, types.SimpleNamespace(tool_args={}), context
         )
-        assert result == {"success": True, "result": {"status": "scheduled_after_turn"}}
+        assert result.data == {"status": "scheduled_after_turn"}
+        assert result.error is False
         assert hangups == []
         bridge._complete_deferred_hangup()
         assert hangups == ["bye"]
+        client.state = platform.SipState.REGISTERED
+        result = await tools.tools[0].async_call(
+            hass, types.SimpleNamespace(tool_args={}), context
+        )
+        assert result.data == {"error": "SIP call is no longer active"}
+        assert result.error is True
         bridge.close()
 
     asyncio.run(run())
