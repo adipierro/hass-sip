@@ -5556,8 +5556,8 @@ def test_assist_barge_in_vad_waits_for_echo_canceller_grace_period():
             barge_in=True,
         )
         bridge._speaking = True
-        with patch.object(assist_mod.time, "monotonic", return_value=100.0):
-            bridge._tts_armed_at = assist_mod.time.monotonic()
+        with patch.object(assist_mod, "_monotonic", return_value=100.0):
+            bridge._tts_armed_at = assist_mod._monotonic()
             frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
             for _ in range(50):
                 bridge.write(frame)
@@ -5585,19 +5585,19 @@ def test_assist_barge_in_grace_starts_at_first_reply_frame():
         await bridge._play_tts_stream(stream, epoch=0)
         assert bridge._tts_armed_at is None
         source = played[0]
+        assert isinstance(source, assist_mod._OnStartSource)
 
         class _Inner:
             async def run(self, push, is_active):
                 push(b"\x00\x00")
                 push(b"\x00\x00")
 
-        wrapped = assist_mod._OnStartSource(_Inner(), bridge._arm_barge_in_grace)
+        source._inner = _Inner()
         pushed = []
-        with patch.object(assist_mod.time, "monotonic", return_value=100.0):
-            await wrapped.run(pushed.append, lambda: True)
+        with patch.object(assist_mod, "_monotonic", return_value=100.0):
+            await source.run(pushed.append, lambda: True)
         assert bridge._tts_armed_at == 100.0
         assert len(pushed) == 2
-        assert isinstance(source, assist_mod._OnStartSource)
         bridge.close()
 
     asyncio.run(run())
@@ -5609,7 +5609,7 @@ def test_assist_end_cue_handover_arms_barge_in_grace():
         MagicMock(), play_source_fn=MagicMock(), on_done_fn=MagicMock()
     )
     bridge._cue_handover = True
-    with patch.object(assist_mod.time, "monotonic", return_value=50.0):
+    with patch.object(assist_mod, "_monotonic", return_value=50.0):
         bridge._end_cue_handover()
     assert bridge._tts_armed_at == 50.0
 
@@ -5635,18 +5635,33 @@ def test_assist_barge_in_resumes_after_grace_and_keeps_grace_audio():
         bridge._speaking = True
         bridge._tts_armed_at = 100.0
         frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
-        with patch.object(assist_mod.time, "monotonic", return_value=101.0):
+        with patch.object(assist_mod, "_monotonic", return_value=101.0):
             for _ in range(100):  # 1 s inside the grace window
                 bridge.write(frame)
         assert bridge._post_barge_in_capture is False
         # Grace audio is retained beyond the normal 500 ms preroll.
         assert len(bridge._ring_buffer) > assist_mod._PREROLL_MAX_BYTES
         grace_bytes = len(bridge._ring_buffer)
-        with patch.object(assist_mod.time, "monotonic", return_value=102.1):
+        with patch.object(assist_mod, "_monotonic", return_value=102.1):
             for _ in range(3):
                 bridge.write(frame)
         assert bridge._post_barge_in_capture is True
         assert len(bridge._barge_in_preroll) >= grace_bytes
+
+        # A barge-in long after the grace window keeps only the normal preroll.
+        bridge2 = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            barge_in=True,
+        )
+        bridge2._speaking = True
+        bridge2._tts_armed_at = 100.0
+        with patch.object(assist_mod, "_monotonic", return_value=110.0):
+            for _ in range(250):
+                bridge2.write(frame)
+        assert bridge2._post_barge_in_capture is True
+        assert len(bridge2._barge_in_preroll) <= assist_mod._PREROLL_MAX_BYTES
     finally:
         assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
         assist_mod.MicroVad = original_micro_vad

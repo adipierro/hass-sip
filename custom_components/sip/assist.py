@@ -57,6 +57,7 @@ _VAD_FRAME_BYTES = 320  # 10 ms @ 16 kHz s16le mono
 _VAD_SPEECH_THRESHOLD = 0.5
 _VAD_MIN_SPEECH_FRAMES = 30  # 300 ms consecutive speech
 _BARGE_IN_VAD_GRACE_SECONDS = 2.0
+_monotonic = time.monotonic  # patched in tests without touching the event loop
 # Shorter than barge-in: a 100 ms utterance after TTS must still count.
 _GAP_MIN_SPEECH_FRAMES = 5  # 50 ms consecutive speech
 _PREROLL_BYTES_PER_SECOND = 32000  # 16 kHz s16le mono
@@ -487,7 +488,7 @@ class AssistBridge(AudioSink):
         self._append_rx_to_ring(pcm_16k)
         if (
             self._tts_armed_at is not None
-            and time.monotonic() - self._tts_armed_at < _BARGE_IN_VAD_GRACE_SECONDS
+            and _monotonic() - self._tts_armed_at < _BARGE_IN_VAD_GRACE_SECONDS
         ):
             # Let the phone's echo canceller adapt to the new downlink signal
             # before treating received audio as caller speech.
@@ -511,7 +512,14 @@ class AssistBridge(AudioSink):
         """Interrupt TTS playback and preserve preroll for the next STT turn."""
         LOGGER.info("Assist barge-in detected")
         self._cancel_inflight_tts(stop_audio=True)
-        self._barge_in_preroll = bytes(self._ring_buffer)
+        preroll = bytes(self._ring_buffer)
+        armed_at = self._tts_armed_at
+        # Audio from the grace window is only worth keeping when the caller
+        # started speaking inside it; later on it is just residual echo.
+        grace_tail = _BARGE_IN_VAD_GRACE_SECONDS + _VAD_MIN_SPEECH_FRAMES * 0.01
+        if armed_at is None or _monotonic() - armed_at > grace_tail + 0.5:
+            preroll = preroll[-_PREROLL_MAX_BYTES:]
+        self._barge_in_preroll = preroll
         self._vad_pending.clear()
         self._vad_speech_frames = 0
         self._ring_buffer.clear()
@@ -863,7 +871,7 @@ class AssistBridge(AudioSink):
 
     def _arm_barge_in_grace(self) -> None:
         """Start the barge-in grace window at the first reply frame."""
-        self._tts_armed_at = time.monotonic()
+        self._tts_armed_at = _monotonic()
 
     async def _play_turn_tone(self) -> None:
         """Play the turn-start tone (beep or configured media), if enabled."""
