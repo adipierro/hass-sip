@@ -186,7 +186,7 @@ If you prefer triggering directly from the Event Bus, the integration fires the 
 |-------|-----------|------------|
 | `sip_registered` | – | Successfully registered with the PBX |
 | `sip_state_changed` | `state` | The SIP line state changes (`idle`, `registering`, `registered`, `inviting`, `ringing_out`, `incoming`, `answering`, `in_call`) |
-| `sip_incoming_call` | `caller`, `contact_name`, `sip_display_name` | An inbound call arrives |
+| `sip_incoming_call` | `caller`, `caller_name`, `contact_name`, `sip_display_name` | An inbound call arrives |
 | `sip_call_connected` | – | A call becomes two-way connected (use this before playing media) |
 | `sip_playback_done` | `error` (only on failure) | A TTS/audio source has **finished transmitting** to the remote party — or could not be played at all, in which case `error` is a short reason (`ffmpeg exited with status N`, `ffmpeg produced no audio`) without media URLs |
 | `sip_call_ended` | – | The call ended (either side hung up) |
