@@ -32,7 +32,7 @@ class SipHangUpCurrentCallTool(llm.Tool):
         read_only=False,
         destructive=True,
         idempotent=True,
-        open_world=True,
+        open_world=False,
     )
 
     def __init__(
