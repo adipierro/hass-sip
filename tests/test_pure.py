@@ -1892,6 +1892,11 @@ def test_caller_id_name_handles_unquoted_escaped_and_missing_names():
     assert sip_client.SipClient._extract_caller_id_name(unquoted) == "Front Desk"
     assert sip_client.SipClient._extract_caller_id_name(unnamed) == ""
 
+    angle_in_quotes = _invite_request(frm='"A <B>" <sip:103@example>')
+    unterminated = _invite_request(frm='"Alice <sip:104@example>')
+    assert sip_client.SipClient._extract_caller_id_name(angle_in_quotes) == "A <B>"
+    assert sip_client.SipClient._extract_caller_id_name(unterminated) == "Alice"
+
 
 def _outbound_in_call():
     incoming = []

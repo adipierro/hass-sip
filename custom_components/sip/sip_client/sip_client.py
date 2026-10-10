@@ -1235,18 +1235,13 @@ class SipClient:
     def _extract_caller_id_name(m: sm.SipMessage) -> str:
         """Return the display-name portion of the SIP From header."""
         frm = m.header("From").strip()
+        quoted = re.match(r'"((?:[^"\\]|\\.)*)"\s*<', frm)
+        if quoted:
+            return re.sub(r"\\(.)", r"\1", quoted.group(1)).strip()
         angle = frm.find("<")
         if angle <= 0:
             return ""
-        display_name = frm[:angle].strip()
-        if (
-            len(display_name) >= 2
-            and display_name[0] == '"'
-            and display_name[-1] == '"'
-        ):
-            display_name = display_name[1:-1]
-            display_name = re.sub(r"\\(.)", r"\1", display_name)
-        return display_name.strip()
+        return frm[:angle].strip().lstrip('"').strip()
 
     def _build_response(
         self,

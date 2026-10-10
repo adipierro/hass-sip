@@ -157,11 +157,11 @@ Each SIP extension device includes a **Call Events** entity (e.g. `event.phone_l
 You can use this entity as a trigger in the Home Assistant Automation Editor.
 
 Supported event types (`event_type` attribute):
-- `incoming`: Fired when an inbound call arrives. Attributes: `caller`, `contact_name`, `sip_display_name`.
+- `incoming`: Fired when an inbound call arrives. Attributes: `caller`, `caller_name`, `contact_name`, `sip_display_name`.
   `contact_name` is the name resolved through `sip_contacts.json` (or the caller
   number when no contact matches). `sip_display_name` is the display-name text
   supplied in the SIP `From` header, or an empty string when none was supplied.
-  The older `caller_name` and `caller_id_name` attributes remain as compatibility aliases.
+  `caller_name` is kept as an alias of `contact_name`.
 - `connected`: Fired when the call is answered.
 - `playback_done`: Fired when TTS or audio playback finishes. If the source could not be played (ffmpeg error, unreadable file/URL) it still fires, with a short `error` attribute (for example `ffmpeg exited with status 1`) so a flow waiting on it does not stall. The attribute does not include media URLs.
 - `ended`: Fired when the call ends.
