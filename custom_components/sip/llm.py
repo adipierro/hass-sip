@@ -53,10 +53,11 @@ class SipHangUpCurrentCallTool(llm.Tool):
             get_assist is not None
             and get_assist() is self._bridge
             and self._bridge.allow_llm_hangup
-            and self._bridge._running
-            and llm_context.device_id == self._bridge._device_id
+            and self._bridge.is_running
             and llm_context.context is not None
-            and llm_context.context.user_id == self._bridge._context.user_id
+            and self._bridge.matches_llm_context(
+                llm_context.device_id, llm_context.context.user_id
+            )
             and self._client.state in (SipState.IN_CALL, SipState.ANSWERING)
         )
 

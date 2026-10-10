@@ -4042,7 +4042,6 @@ def _setup_assist_deps():
 
     class _PipelineEventType:
         RUN_START = "run-start"
-        INTENT_PROGRESS = "intent-progress"
         STT_END = "stt-end"
         INTENT_PROGRESS = "intent-progress"
         INTENT_END = "intent-end"
@@ -6102,6 +6101,90 @@ def test_assist_hangup_tool_call_ignored_without_opt_in():
     bridge.close()
 
 
+def test_assist_hangup_tool_call_ignored_when_call_not_active():
+    """The progress-event path honours the same call-state check as the tool."""
+    assist_mod, _, PET, PE = _assist_ctx()
+    hangups: list[str] = []
+    call_active = {"value": False}
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            hangup_allowed_fn=lambda: call_active["value"],
+            allow_llm_hangup=True,
+        )
+        event = PE(
+            PET.INTENT_PROGRESS,
+            {
+                "chat_log_delta": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "tool_name": "sip__hang_up_current_call",
+                            "tool_args": {},
+                            "external": False,
+                        }
+                    ],
+                }
+            },
+        )
+        bridge._on_pipeline_event(event)
+        assert bridge._hangup_requested is False
+        bridge._complete_deferred_hangup()
+        assert hangups == []
+        call_active["value"] = True
+        bridge._on_pipeline_event(event)
+        assert bridge._hangup_requested is True
+        bridge.close()
+
+    asyncio.run(run())
+
+
+def test_assist_hangup_is_not_lost_when_session_ends_first():
+    assist_mod, _, _, _ = _assist_ctx()
+    hangups: list[str] = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            allow_llm_hangup=True,
+        )
+        assert bridge.request_hangup_after_turn() is True
+        with patch.object(
+            assist_mod, "async_get_pipeline", side_effect=RuntimeError("boom")
+        ):
+            await bridge._run_session()
+        assert hangups == ["bye"]
+
+    asyncio.run(run())
+
+
+def test_assist_hangup_not_fired_when_closed_before_turn_ends():
+    assist_mod, _, _, _ = _assist_ctx()
+    hangups: list[str] = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            hangup_fn=lambda: hangups.append("bye"),
+            allow_llm_hangup=True,
+        )
+        bridge.request_hangup_after_turn()
+        bridge.close()
+        bridge._complete_deferred_hangup()
+        assert hangups == []
+
+    asyncio.run(run())
+
+
 def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
     monkeypatch,
 ):
@@ -6188,6 +6271,23 @@ def test_assist_hangup_tool_is_available_and_callable_for_active_sip_context(
         bridge.close()
 
     asyncio.run(run())
+
+    other_device = types.SimpleNamespace(
+        device_id="other", context=types.SimpleNamespace(user_id="sip-user")
+    )
+    other_user = types.SimpleNamespace(
+        device_id="sip-device", context=types.SimpleNamespace(user_id="someone")
+    )
+    stale = platform.SipHangUpCurrentCallTool(
+        {"get_assist": lambda: object()}, bridge, client
+    )
+    client.state = platform.SipState.IN_CALL
+    live = platform.SipHangUpCurrentCallTool(data, bridge, client)
+    assert not live._is_current_call(other_device)
+    assert not live._is_current_call(other_user)
+    assert not stale._is_current_call(context)
+    assert platform.async_get_tools(hass, other_device, "assist") is None
+    assert platform.async_get_tools(hass, context, "not-assist") is None
 
 
 def test_assist_turn_tone_playback_done_does_not_set_tts_event():

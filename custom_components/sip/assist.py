@@ -73,7 +73,6 @@ _PROCESSING_BEEP_REPEAT_GAP_MS = 1500
 # minute; this is a safety net for a lost on_playback_done signal, not a
 # normal-case ceiling, so it stays generous.
 _TTS_WAIT_TIMEOUT_SECONDS = 300
-_DEFERRED_HANGUP_TIMEOUT_SECONDS = 30
 _TxWaitKind = Literal["tts", "tone"]
 
 
@@ -232,6 +231,7 @@ class AssistBridge(AudioSink):
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
         hangup_fn: Callable[[], None] | None = None,
+        hangup_allowed_fn: Callable[[], bool] | None = None,
         allow_llm_hangup: bool = False,
         user_id: str | None = None,
         device_id: str | None = None,
@@ -269,6 +269,7 @@ class AssistBridge(AudioSink):
         self.stop_audio_fn = stop_audio_fn
         self.media_playing_fn = media_playing_fn
         self.hangup_fn = hangup_fn
+        self.hangup_allowed_fn = hangup_allowed_fn
         self.allow_llm_hangup = allow_llm_hangup
         self._context = Context(user_id=user_id)
         self._device_id = device_id
@@ -285,7 +286,6 @@ class AssistBridge(AudioSink):
         self._listening = False
         self._speaking = False
         self._hangup_requested = False
-        self._hangup_timeout: asyncio.TimerHandle | None = None
         self._tx_done = asyncio.Event()
         self._tx_wait: _TxWaitKind | None = None
         self._turn_error: str | None = None
@@ -355,9 +355,6 @@ class AssistBridge(AudioSink):
     def close(self) -> None:
         """Stop the bridge and cancel running tasks."""
         self._hangup_requested = False
-        if self._hangup_timeout is not None:
-            self._hangup_timeout.cancel()
-            self._hangup_timeout = None
         self._running = False
         self._listening = False
         self._speaking = False
@@ -402,27 +399,31 @@ class AssistBridge(AudioSink):
                 # dispatch list even though the agent emitted its call.
                 self.request_hangup_after_turn()
 
+    @property
+    def is_running(self) -> bool:
+        """Whether the Assist session is still active."""
+        return self._running
+
+    def matches_llm_context(self, device_id: str | None, user_id: str | None) -> bool:
+        """Whether an LLM request belongs to this bridge's device and user."""
+        return device_id == self._device_id and user_id == self._context.user_id
+
     def request_hangup_after_turn(self) -> bool:
         """Queue a SIP hang-up after this intent turn and its TTS finish."""
         if not self.allow_llm_hangup or not self._running or self.hangup_fn is None:
             return False
-        if self._hangup_requested:
-            return True
-        self._hangup_requested = True
-        self._hangup_timeout = asyncio.get_running_loop().call_later(
-            _DEFERRED_HANGUP_TIMEOUT_SECONDS, self._complete_deferred_hangup
-        )
-        LOGGER.info("Assist Hang Up tool scheduled after current turn")
+        if self.hangup_allowed_fn is not None and not self.hangup_allowed_fn():
+            return False
+        if not self._hangup_requested:
+            self._hangup_requested = True
+            LOGGER.info("Assist Hang Up tool scheduled after current turn")
         return True
 
     def _complete_deferred_hangup(self) -> None:
-        """End the current call after TTS, or after the bounded wait expires."""
+        """End the current call once the turn and its spoken reply are done."""
         if not self._hangup_requested or not self._running:
             return
         self._hangup_requested = False
-        if self._hangup_timeout is not None:
-            self._hangup_timeout.cancel()
-            self._hangup_timeout = None
         LOGGER.info("Assist Hang Up tool ending call after turn")
         if self.hangup_fn is not None:
             self.hangup_fn()
@@ -704,6 +705,8 @@ class AssistBridge(AudioSink):
         except Exception as err:
             LOGGER.exception("Assist session error: %s", err)
         finally:
+            # A scheduled hang-up must not be lost if the session ends first.
+            self._complete_deferred_hangup()
             self._running = False
             self._listening = False
             self._speaking = False

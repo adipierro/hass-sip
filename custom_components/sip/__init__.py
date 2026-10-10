@@ -654,6 +654,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             stop_audio_fn=client.stop_audio,
             media_playing_fn=lambda: client.media_playing,
             hangup_fn=client.hangup,
+            hangup_allowed_fn=lambda: client.state
+            in (SipState.IN_CALL, SipState.ANSWERING),
             user_id=assist_user_id,
             device_id=_sip_device_id(hass, entry.entry_id),
         )
